@@ -1,0 +1,364 @@
+From 51738cc7b889a196cdcd5cba0b1bda7d4eb145fa Mon Sep 17 00:00:00 2001
+From: jiulongb <jiulong.bao@intel.com>
+Date: Mon, 31 May 2021 09:42:33 +0800
+Subject: [PATCH] cluster extraction TBB
+
+---
+ segmentation/CMakeLists.txt                   |   2 +-
+ .../pcl/segmentation/extract_clusters.h       |  21 ++
+ .../segmentation/impl/extract_clusters.hpp    | 258 +++++++++++++++++-
+ 3 files changed, 278 insertions(+), 3 deletions(-)
+
+diff --git a/segmentation/CMakeLists.txt b/segmentation/CMakeLists.txt
+index b8db7cd..d57ef24 100644
+--- a/segmentation/CMakeLists.txt
++++ b/segmentation/CMakeLists.txt
+@@ -102,7 +102,7 @@ set(impl_incs
+ set(LIB_NAME "pcl_${SUBSYS_NAME}")
+ include_directories("${CMAKE_CURRENT_SOURCE_DIR}/include")
+ PCL_ADD_LIBRARY(${LIB_NAME} COMPONENT ${SUBSYS_NAME} SOURCES ${srcs} ${incs} ${impl_incs})
+-target_link_libraries("${LIB_NAME}" pcl_search pcl_sample_consensus pcl_filters pcl_ml pcl_features)
++target_link_libraries("${LIB_NAME}" pcl_search pcl_sample_consensus pcl_filters pcl_ml pcl_features -ltbb)
+ PCL_MAKE_PKGCONFIG(${LIB_NAME} COMPONENT ${SUBSYS_NAME} DESC ${SUBSYS_DESC} PCL_DEPS ${SUBSYS_DEPS})
+ 
+ # Install include files
+diff --git a/segmentation/include/pcl/segmentation/extract_clusters.h b/segmentation/include/pcl/segmentation/extract_clusters.h
+index 9ab0c84..a9067e6 100644
+--- a/segmentation/include/pcl/segmentation/extract_clusters.h
++++ b/segmentation/include/pcl/segmentation/extract_clusters.h
+@@ -43,6 +43,8 @@
+ 
+ #include <pcl/search/pcl_search.h>
+ 
++#define TBB_TEST 1
++
+ namespace pcl
+ {
+   //////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+@@ -310,6 +312,7 @@ namespace pcl
+       /** \brief Empty constructor. */
+       EuclideanClusterExtraction () : tree_ (), 
+                                       cluster_tolerance_ (0),
++                                      tbb_mode_(false),
+                                       min_pts_per_cluster_ (1), 
+                                       max_pts_per_cluster_ (std::numeric_limits<int>::max ())
+       {};
+@@ -385,7 +388,22 @@ namespace pcl
+         */
+       void 
+       extract (std::vector<PointIndices> &clusters);
++#if TBB_TEST
++        std::vector<int> m_seed_queue;
++
++	  inline void 
++	   setMultiThread(bool tbb) 
++	   { 
++		 tbb_mode_=tbb; 
++	   }
++
++      int	 
++      getSeedQueue(std::vector<PointIndices> &clusters, int index);  
+ 
++       void 
++      extractClustersTBB ( const Indices &indices,std::vector<PointIndices> &clusters);
++#endif
++		
+     protected:
+       // Members derived from the base class
+       using BasePCLBase::input_;
+@@ -404,6 +422,9 @@ namespace pcl
+ 
+       /** \brief The maximum number of points that a cluster needs to contain in order to be considered valid (default = MAXINT). */
+       int max_pts_per_cluster_;
++#if  TBB_TEST
++     bool tbb_mode_;
++#endif
+ 
+       /** \brief Class getName method. */
+       virtual std::string getClassName () const { return ("EuclideanClusterExtraction"); }
+diff --git a/segmentation/include/pcl/segmentation/impl/extract_clusters.hpp b/segmentation/include/pcl/segmentation/impl/extract_clusters.hpp
+index 17ac604..2946884 100644
+--- a/segmentation/include/pcl/segmentation/impl/extract_clusters.hpp
++++ b/segmentation/include/pcl/segmentation/impl/extract_clusters.hpp
+@@ -39,7 +39,10 @@
+ #define PCL_SEGMENTATION_IMPL_EXTRACT_CLUSTERS_H_
+ 
+ #include <pcl/segmentation/extract_clusters.h>
+-
++#if TBB_TEST
++#include <tbb/tbb.h>
++#include <sys/time.h>
++#endif
+ //////////////////////////////////////////////////////////////////////////////////////////////
+ template <typename PointT> void
+ pcl::extractEuclideanClusters (const PointCloud<PointT> &cloud,
+@@ -112,6 +115,250 @@ pcl::extractEuclideanClusters (const PointCloud<PointT> &cloud,
+   }
+ }
+ 
++
++
++#if TBB_TEST
++using namespace tbb;
++using namespace pcl;
++
++tbb::spin_mutex process_lock;
++tbb::spin_mutex seed_queue_lock;
++
++std::vector<bool> m_processed;
++std::vector<int> m_cluster_points_queue ;
++std::vector<int> m_seed_queue_tmp;
++
++
++template <typename PointT>
++class ClusterExtractionTBB {
++
++public:
++	typename search::Search<PointT>::Ptr m_tree;
++	PointCloud<PointT> m_cloud;
++	float m_tolerance;
++
++    void operator()( const blocked_range<size_t>& r ) {
++	size_t begin =r.begin();
++	size_t end =r.end();
++	int tid = tbb::this_task_arena::current_thread_index();
++	int  indices;
++
++	while(true)
++	{	
++		Indices nn_indices;
++		std::vector<float> nn_distances;
++	   
++		{
++		 	tbb::spin_mutex::scoped_lock lock_seed(seed_queue_lock);
++			if(m_seed_queue_tmp.empty()){
++			  break;
++			}
++			indices=*m_seed_queue_tmp.begin();
++			m_seed_queue_tmp.erase(m_seed_queue_tmp.begin());
++		}
++
++		int ret = m_tree->radiusSearch (m_cloud[indices], m_tolerance, nn_indices, nn_distances);
++		if( ret == -1)
++		 {
++		   PCL_ERROR("[pcl::extractEuclideanClusters] Received error code -1 from radiusSearch\n");
++		   exit(0);
++		 }
++		 if (!ret)
++		 {
++		 	printf("find 0 points \n");
++		   //continue;
++		 }
++		 
++		 {
++			 tbb::spin_mutex::scoped_lock process(process_lock);	 
++			 for (std::size_t j = 0; j < nn_indices.size (); ++j)			 // can't assume sorted (default isn't!)
++			 {			 
++			   if (nn_indices[j] == -1 || m_processed[nn_indices[j]]) 	   // Has this point been processed before ?
++				 continue;
++			   
++			   // Perform a simple Euclidean clustering
++			   m_cluster_points_queue.push_back (nn_indices[j]);
++			   m_processed[nn_indices[j]] = true;
++			   tbb::spin_mutex::scoped_lock lock_seed(seed_queue_lock);
++			   m_seed_queue_tmp.push_back (nn_indices[j]);
++			 }
++		 }
++	
++        	}
++}
++
++    ClusterExtractionTBB( ClusterExtractionTBB& x, split )  {
++		int tid = tbb::this_task_arena::current_thread_index();
++		m_cloud=x.m_cloud;
++		m_tree=x.m_tree;
++		m_tolerance=x.m_tolerance;
++}
++
++    ClusterExtractionTBB(std::vector<int>& sq  ) {
++    	//printf("ClusterExtractionTBB \n");
++}
++
++
++ void
++SetParameters(const PointCloud<PointT> &cloud,
++                               const Indices &indices,
++                               const typename search::Search<PointT>::Ptr &tree,
++                               float tolerance){
++	m_cloud=cloud;
++	m_tree = tree ;
++	m_tolerance=static_cast<float> (tolerance);
++			
++}
++ 
++ void join( const ClusterExtractionTBB & y ) {	
++	 int tid = tbb::this_task_arena::current_thread_index();
++ }
++
++};
++
++
++
++template <typename PointT> void 
++pcl::EuclideanClusterExtraction<PointT>::extractClustersTBB ( const Indices &indices,std::vector<PointIndices> &clusters){
++	timeval start_time_1;
++	gettimeofday(&start_time_1,NULL);
++	
++	double count_time=0;
++	// std::vector<int> indices=indices_,
++	const typename search::Search<PointT>::Ptr tree=tree_;
++	//const  boost::shared_ptr<search::Search<PointT> > tree = tree_ ;
++	//const  std::vector<int> &indices = *indices_;
++	float tolerance=static_cast<float> (cluster_tolerance_);
++	unsigned int min_pts_per_cluster=min_pts_per_cluster_;
++	unsigned int max_pts_per_cluster=max_pts_per_cluster_;
++
++
++	  // \note If the tree was created over <cloud, indices>, we guarantee a 1-1 mapping between what the tree returns
++	  //and indices[i]
++	  if ( tree->getInputCloud ()->points.size () != input_->points.size ())
++	  {
++		PCL_ERROR ("[pcl::extractEuclideanClusters] Tree built for a different point cloud dataset (%lu) than the input cloud (%lu)!\n", tree->getInputCloud ()->points.size (), input_->points.size ());
++		return;
++	  }
++	  if ( tree->getIndices ()->size () != indices.size ())
++	  {
++		PCL_ERROR ("[pcl::extractEuclideanClusters] Tree built for a different set of indices (%lu) than the input set (%lu)!\n", tree->getIndices ()->size (), indices.size ());
++		return;
++	  }
++	  // Check if the tree is sorted -- if it is we don't need to check the first element
++	  int nn_start_idx =  tree->getSortedResults () ? 1 : 0;
++	  // Create a bool vector of processed point indices, and initialize it to false
++	std::vector<bool> processed (input_->points.size (), false);
++	 m_processed=processed;
++	 
++	ClusterExtractionTBB < PointT> cetbb(m_seed_queue);
++	cetbb.SetParameters(*input_, *indices_, tree_, static_cast<float> (cluster_tolerance_));
++
++	{
++		for (int index= 0; index< static_cast<int> (indices.size ()); ++index)
++		{  
++			if (m_processed[indices[index]])
++			continue;
++
++			int points=getSeedQueue( clusters,index); 		
++
++			if(!m_seed_queue.empty()){
++				m_seed_queue_tmp=m_seed_queue;
++		
++				int size=m_seed_queue_tmp.size();
++				std::vector<int>().swap(m_seed_queue);
++				parallel_reduce( blocked_range<size_t>(0,size), cetbb );
++			}
++
++			if (m_cluster_points_queue.size () >= min_pts_per_cluster && m_cluster_points_queue.size () <= max_pts_per_cluster)
++			{
++				pcl::PointIndices r;
++				r.indices.resize (m_cluster_points_queue.size ());
++				for (size_t j = 0; j < m_cluster_points_queue.size (); ++j)
++				// This is the only place where indices come into play
++				r.indices[j] = m_cluster_points_queue[j];
++
++				// These two lines should not be needed: (can anyone confirm?) -FF
++				//r.indices.assign(seed_queue.begin(), seed_queue.end());
++				std::sort (r.indices.begin (), r.indices.end ());
++				r.indices.erase (std::unique (r.indices.begin (), r.indices.end ()), r.indices.end ());
++				r.header = input_->header;
++				clusters.push_back (r);  // We could avoid a copy by working directly in the vector
++			}
++			
++			std::vector<int>().swap(m_cluster_points_queue);
++			std::vector<int>().swap(m_seed_queue_tmp);
++		}	
++	}
++  
++		 printf("extractTBB  point size=%d cluster size=%d \n",indices.size (),clusters.size());
++
++}
++
++template <typename PointT> int 
++pcl::EuclideanClusterExtraction<PointT>::getSeedQueue(std::vector<PointIndices> &clusters,int index){
++	double count_time=0;
++	// std::vector<int> indices=indices_,
++	const typename search::Search<PointT>::Ptr  tree = tree_ ;
++	const  std::vector<int> &indices	=	*indices_;
++	float tolerance=static_cast<float> (cluster_tolerance_);
++	unsigned int min_pts_per_cluster=min_pts_per_cluster_;
++	unsigned int max_pts_per_cluster=max_pts_per_cluster_;
++	int find_points;
++	
++	// Check if the tree is sorted -- if it is we don't need to check the first element
++	int nn_start_idx =  tree->getSortedResults () ? 1 : 0;
++	// Create a bool vector of processed point indices, and initialize it to false
++	// std::vector<bool> processed (input_->points.size (), false);
++	
++
++	std::vector<int> nn_indices;
++	std::vector<float> nn_distances;
++	// Process all points in the indices vector  
++	if(m_processed[indices[index]] )
++		return 0;
++	
++	m_cluster_points_queue.push_back (indices[index]);
++	m_seed_queue.push_back (indices[index]);
++	int cloud_index=m_seed_queue[0];
++	m_processed[indices[index]] = true;
++
++	while(!m_seed_queue.empty()){
++
++		  m_seed_queue.erase(m_seed_queue.begin());
++		  int ret = tree->radiusSearch ( input_->points[cloud_index], tolerance, nn_indices, nn_distances);
++
++		  if( ret == -1)
++		  {
++			PCL_ERROR("[pcl::extractEuclideanClusters] Received error code -1 from radiusSearch\n");
++			exit(0);
++		  }
++		  if (!ret)
++		  {
++			//m_cluster_index++;
++			continue;
++		  }
++		 	
++		  for (size_t j = nn_start_idx; j < nn_indices.size (); ++j)			 // can't assume sorted (default isn't!)
++		  {	
++			if (nn_indices[j] == -1 || m_processed[nn_indices[j]])		// Has this point been processed before ?
++			  continue;
++			
++			// Perform a simple Euclidean clustering
++			m_cluster_points_queue.push_back (nn_indices[j]);	
++			m_seed_queue.push_back (nn_indices[j]);	
++			m_processed[nn_indices[j]] = true;
++		  }
++		  find_points=m_seed_queue.size ();
++		 break;
++		}
++	
++	return find_points;
++}
++
++
++#endif
++
+ //////////////////////////////////////////////////////////////////////////////////////////////
+ /** @todo: fix the return value, make sure the exit is not needed anymore*/
+ template <typename PointT> void
+@@ -228,7 +475,14 @@ pcl::EuclideanClusterExtraction<PointT>::extract (std::vector<PointIndices> &clu
+ 
+   // Send the input dataset to the spatial locator
+   tree_->setInputCloud (input_, indices_);
+-  extractEuclideanClusters (*input_, *indices_, tree_, static_cast<float> (cluster_tolerance_), clusters, min_pts_per_cluster_, max_pts_per_cluster_);
++  
++  #if TBB_TEST
++  if(tbb_mode_)
++	  extractClustersTBB(*indices_,clusters);
++else
++#endif
++  	extractEuclideanClusters (*input_, *indices_, tree_, static_cast<float> (cluster_tolerance_), clusters, min_pts_per_cluster_, max_pts_per_cluster_);
++ 
+ 
+   //tree_->setInputCloud (input_);
+   //extractEuclideanClusters (*input_, tree_, cluster_tolerance_, clusters, min_pts_per_cluster_, max_pts_per_cluster_);
+-- 
+2.17.1
+
