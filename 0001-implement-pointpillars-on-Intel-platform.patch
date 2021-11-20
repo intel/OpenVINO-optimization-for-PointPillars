@@ -1,0 +1,2879 @@
+From d3ea467ca62db27a444d5288573afe74a10e4966 Mon Sep 17 00:00:00 2001
+From: "Xu, Qing" <qing.xu@intel.com>
+Date: Tue, 19 Oct 2021 23:14:22 +0800
+Subject: [PATCH 1/4] implement pointpillars on Intel platform
+
+Signed-off-by: Xu, Qing <qing.xu@intel.com>
+---
+ pcdet/datasets/__init__.py                    |  10 +-
+ pcdet/datasets/dataset.py                     |   2 +
+ pcdet/datasets/kitti/kitti_dataset.py         | 135 +++++-
+ .../kitti/kitti_object_eval_python/eval.py    |   2 +-
+ pcdet/datasets/processor/data_processor.py    |  19 +-
+ pcdet/datasets/processor/voxel_generator2.py  | 178 ++++++++
+ pcdet/models/__init__.py                      |   2 +-
+ .../models/backbones_2d/base_bev_backbone.py  |  68 ++-
+ .../map_to_bev/pointpillar_scatter.py         |  59 ++-
+ pcdet/models/backbones_3d/__init__.py         |   9 -
+ pcdet/models/backbones_3d/vfe/pillar_vfe.py   | 161 ++++++-
+ pcdet/models/dense_heads/__init__.py          |   8 -
+ .../models/dense_heads/anchor_head_single.py  |  60 ++-
+ .../dense_heads/anchor_head_template.py       |   2 +-
+ .../target_assigner/anchor_generator.py       |   6 +-
+ .../axis_aligned_target_assigner.py           |   6 +-
+ pcdet/models/detectors/detector3d_template.py |  65 ++-
+ pcdet/models/detectors/pointpillar.py         | 103 ++++-
+ pcdet/ops/iou3d_nms/iou3d_nms_utils.py        |   4 +-
+ pcdet/ops/iou3d_nms/src/iou3d_cpu.cpp         |  49 ++-
+ pcdet/ops/iou3d_nms/src/iou3d_cpu.h           |   2 -
+ pcdet/ops/iou3d_nms/src/iou3d_nms.cpp         |  62 +--
+ pcdet/ops/iou3d_nms/src/iou3d_nms.h           |   2 -
+ pcdet/ops/iou3d_nms/src/iou3d_nms_api.cpp     |   2 -
+ pcdet/utils/box_coder_utils.py                |   4 +-
+ pcdet/utils/box_utils.py                      |  71 ++-
+ pcdet/utils/calibration_kitti.py              |   9 +
+ pcdet/utils/loss_utils.py                     |   4 +-
+ requirements.txt                              |   4 +-
+ setup.py                                      |  53 +--
+ tools/cfgs/dataset_configs/kitti_dataset.yaml |   5 +-
+ tools/demo.py                                 | 120 ++++--
+ tools/eval_utils/eval_utils.py                | 403 +++++++++++++++++-
+ tools/pointpillar.yaml                        | 144 +++++++
+ tools/test.py                                 |  43 +-
+ 35 files changed, 1598 insertions(+), 278 deletions(-)
+ create mode 100644 pcdet/datasets/processor/voxel_generator2.py
+ create mode 100644 tools/pointpillar.yaml
+
+diff --git a/pcdet/datasets/__init__.py b/pcdet/datasets/__init__.py
+index ee70c2a..582a84a 100644
+--- a/pcdet/datasets/__init__.py
++++ b/pcdet/datasets/__init__.py
+@@ -6,14 +6,14 @@ from pcdet.utils import common_utils
+ 
+ from .dataset import DatasetTemplate
+ from .kitti.kitti_dataset import KittiDataset
+-from .nuscenes.nuscenes_dataset import NuScenesDataset
+-from .waymo.waymo_dataset import WaymoDataset
++#from .nuscenes.nuscenes_dataset import NuScenesDataset
++#from .waymo.waymo_dataset import WaymoDataset
+ 
+ __all__ = {
+     'DatasetTemplate': DatasetTemplate,
+     'KittiDataset': KittiDataset,
+-    'NuScenesDataset': NuScenesDataset,
+-    'WaymoDataset': WaymoDataset
++    #'NuScenesDataset': NuScenesDataset,
++    #'WaymoDataset': WaymoDataset
+ }
+ 
+ 
+@@ -40,7 +40,7 @@ class DistributedSampler(_DistributedSampler):
+         return iter(indices)
+ 
+ 
+-def build_dataloader(dataset_cfg, class_names, batch_size, dist, root_path=None, workers=4,
++def build_dataloader(dataset_cfg, class_names, batch_size, dist, root_path=None, workers=0,
+                      logger=None, training=True, merge_all_iters_to_one_epoch=False, total_epochs=0):
+ 
+     dataset = __all__[dataset_cfg.DATASET](
+diff --git a/pcdet/datasets/dataset.py b/pcdet/datasets/dataset.py
+index f7ce255..70708f5 100644
+--- a/pcdet/datasets/dataset.py
++++ b/pcdet/datasets/dataset.py
+@@ -18,6 +18,8 @@ class DatasetTemplate(torch_data.Dataset):
+         self.class_names = class_names
+         self.logger = logger
+         self.root_path = root_path if root_path is not None else Path(self.dataset_cfg.DATA_PATH)
++        assert self.root_path.exists()
++
+         self.logger = logger
+         if self.dataset_cfg is None or class_names is None:
+             return
+diff --git a/pcdet/datasets/kitti/kitti_dataset.py b/pcdet/datasets/kitti/kitti_dataset.py
+index 07a3ea8..249275d 100644
+--- a/pcdet/datasets/kitti/kitti_dataset.py
++++ b/pcdet/datasets/kitti/kitti_dataset.py
+@@ -1,13 +1,15 @@
+ import copy
+ import pickle
+-
+ import numpy as np
+ from skimage import io
++from pathlib import Path
+ 
+-from ...ops.roiaware_pool3d import roiaware_pool3d_utils
++#from ...ops.roiaware_pool3d import roiaware_pool3d_utils
+ from ...utils import box_utils, calibration_kitti, common_utils, object3d_kitti
+ from ..dataset import DatasetTemplate
+ 
++import cv2 
++import numba
+ 
+ class KittiDataset(DatasetTemplate):
+     def __init__(self, dataset_cfg, class_names, training=True, root_path=None, logger=None):
+@@ -30,6 +32,7 @@ class KittiDataset(DatasetTemplate):
+ 
+         self.kitti_infos = []
+         self.include_kitti_data(self.mode)
++        self.dataptr = None
+ 
+     def include_kitti_data(self, mode):
+         if self.logger is not None:
+@@ -44,10 +47,12 @@ class KittiDataset(DatasetTemplate):
+                 infos = pickle.load(f)
+                 kitti_infos.extend(infos)
+ 
++        assert(kitti_infos) #make sure there is the pkl info file in dataset
++
+         self.kitti_infos.extend(kitti_infos)
+ 
+         if self.logger is not None:
+-            self.logger.info('Total samples for KITTI dataset: %d' % (len(kitti_infos)))
++            self.logger.info('Total samples for KITTI dataset: %d' % (len(self.kitti_infos)))
+ 
+     def set_split(self, split):
+         super().__init__(
+@@ -60,22 +65,27 @@ class KittiDataset(DatasetTemplate):
+         self.sample_id_list = [x.strip() for x in open(split_dir).readlines()] if split_dir.exists() else None
+ 
+     def get_lidar(self, idx):
+-        lidar_file = self.root_split_path / 'velodyne' / ('%s.bin' % idx)
++        lidar_file = self.root_split_path / 'velodyne' / ('%s.bin' % str(idx).zfill(6))
+         assert lidar_file.exists()
+         return np.fromfile(str(lidar_file), dtype=np.float32).reshape(-1, 4)
+ 
+     def get_image_shape(self, idx):
+-        img_file = self.root_split_path / 'image_2' / ('%s.png' % idx)
++        if self.dataptr is not None:
++            return np.array(self.dataptr[idx].shape[:2], dtype=np.int32)
++
++        img_file = self.root_split_path / 'image_2' / ('%s.png' % str(idx).zfill(6))
+         assert img_file.exists()
+         return np.array(io.imread(img_file).shape[:2], dtype=np.int32)
+ 
+     def get_label(self, idx):
+-        label_file = self.root_split_path / 'label_2' / ('%s.txt' % idx)
++        label_file = self.root_split_path / 'label_2' / ('%s.txt' % str(idx).zfill(6))
+         assert label_file.exists()
+         return object3d_kitti.get_objects_from_label(label_file)
+ 
+     def get_calib(self, idx):
+-        calib_file = self.root_split_path / 'calib' / ('%s.txt' % idx)
++        calib_file = self.root_split_path / 'calib' / ('%s.txt' % str(idx).zfill(6))
++        #print("get calib file: {}".format(calib_file))
++
+         assert calib_file.exists()
+         return calibration_kitti.Calibration(calib_file)
+ 
+@@ -242,8 +252,14 @@ class KittiDataset(DatasetTemplate):
+         with open(db_info_save_path, 'wb') as f:
+             pickle.dump(all_db_infos, f)
+ 
+-    @staticmethod
+-    def generate_prediction_dicts(batch_dict, pred_dicts, class_names, output_path=None):
++    def get_datapath(self):
++        return self.root_split_path
++
++    def set_dataptr(self, dataptr):
++        self.dataptr = dataptr
++
++    #@staticmethod
++    def generate_prediction_dicts(self, batch_dict, pred_dicts, class_names, output_path=None):
+         """
+         Args:
+             batch_dict:
+@@ -295,6 +311,7 @@ class KittiDataset(DatasetTemplate):
+             return pred_dict
+ 
+         annos = []
++        disp_threshold = 0.4
+         for index, box_dict in enumerate(pred_dicts):
+             frame_id = batch_dict['frame_id'][index]
+ 
+@@ -303,21 +320,54 @@ class KittiDataset(DatasetTemplate):
+             annos.append(single_pred_dict)
+ 
+             if output_path is not None:
+-                cur_det_file = output_path / ('%s.txt' % frame_id)
++                cur_det_file = output_path / ('pcl_%s.csv' % str(frame_id['lidar_idx']).zfill(6))
+                 with open(cur_det_file, 'w') as f:
+                     bbox = single_pred_dict['bbox']
+                     loc = single_pred_dict['location']
+                     dims = single_pred_dict['dimensions']  # lhw -> hwl
+ 
++                    img_file = self.root_split_path / 'image_2' / ('%s.png' % str(frame_id['lidar_idx']).zfill(6))
++                    assert img_file.exists()
++                    cur_img_file = output_path / ('pcl_%s.png' % str(frame_id['lidar_idx']).zfill(6))
++                    frame = cv2.imread(str(img_file))
++                    lidar_color = (255,255,255)
++
+                     for idx in range(len(bbox)):
+-                        print('%s -1 -1 %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f'
++                        lbox = single_pred_dict['boxes_lidar']
++                        print('lidar box: %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f'
++                              % (
++                                 lbox[idx][0], lbox[idx][1], lbox[idx][2], lbox[idx][3],
++                                 lbox[idx][4], lbox[idx][5], lbox[idx][6]
++                                 ), file=f)
++                        x_color = int(((lbox[idx][0] if lbox[idx][0] <= 70 else 70)/70) * 255)
++                        lidar_color = (255, x_color, x_color)
++                        xmin = bbox[idx][0]
++                        ymin = bbox[idx][1]
++                        xmax = bbox[idx][2]
++                        ymax = bbox[idx][3]
++
++                        xmin = int(bbox[idx][0])
++                        ymin = int(bbox[idx][1])
++                        xmax = int(bbox[idx][2])
++                        ymax = int(bbox[idx][3])
++
++                        if single_pred_dict['score'][idx] < disp_threshold:
++                            continue
++                        #print('%s -1 -1 %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f'
++                        print('image box: %s, -1, -1, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f'
+                               % (single_pred_dict['name'][idx], single_pred_dict['alpha'][idx],
+                                  bbox[idx][0], bbox[idx][1], bbox[idx][2], bbox[idx][3],
+                                  dims[idx][1], dims[idx][2], dims[idx][0], loc[idx][0],
+                                  loc[idx][1], loc[idx][2], single_pred_dict['rotation_y'][idx],
+                                  single_pred_dict['score'][idx]), file=f)
+ 
+-        return annos
++                        cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), lidar_color, 2)
++                        cv2.putText(frame, 'lidar_{}'.format(idx), (xmin, ymin + 17),
++                              cv2.FONT_HERSHEY_COMPLEX, 0.4, lidar_color, 1)
++                    cv2.imwrite(str(cur_img_file), frame)
++                    print ("Save pcl proj result to: %s" % cur_img_file)
++
++        return annos, frame if output_path is not None else None
+ 
+     def evaluation(self, det_annos, class_names, **kwargs):
+         if 'annos' not in self.kitti_infos[0].keys():
+@@ -344,15 +394,23 @@ class KittiDataset(DatasetTemplate):
+ 
+         info = copy.deepcopy(self.kitti_infos[index])
+ 
+-        sample_idx = info['point_cloud']['lidar_idx']
++        pc_info = {'num_features': 4, 'lidar_idx': index}
++        sample_idx = pc_info
++        image_info = {'image_idx': index, 'image_shape': self.get_image_shape(index)}
++        info['image'] = image_info
+ 
+-        points = self.get_lidar(sample_idx)
+-        calib = self.get_calib(sample_idx)
++        points = self.get_lidar(index)
++        calib = self.get_calib(index)
+ 
+         img_shape = info['image']['image_shape']
+         if self.dataset_cfg.FOV_POINTS_ONLY:
+-            pts_rect = calib.lidar_to_rect(points[:, 0:3])
+-            fov_flag = self.get_fov_flag(pts_rect, img_shape, calib)
++            #pts_rect = calib.lidar_to_rect(points[:, 0:3])
++            #fov_flag = self.get_fov_flag(pts_rect, img_shape, calib)
++            v2c = calib.get_V2C()
++            p2 = calib.get_P2()
++            r0 = calib.get_R0()
++            pts_rect = lidar_to_rect_numba(points[:, 0:3], v2c, r0)
++            fov_flag = get_fov_flag_numba(pts_rect, img_shape, p2)
+             points = points[fov_flag]
+ 
+         input_dict = {
+@@ -382,6 +440,49 @@ class KittiDataset(DatasetTemplate):
+         data_dict['image_shape'] = img_shape
+         return data_dict
+ 
++@numba.jit(nopython=True)
++def cart_to_hom_numba(pts):
++    """
++    :param pts: (N, 3 or 2)
++    :return pts_hom: (N, 4 or 3)
++    """
++    pts_hom = np.hstack((pts, np.ones((pts.shape[0], 1), dtype=np.float32)))
++    return pts_hom
++
++@numba.jit(nopython=True)
++def lidar_to_rect_numba(pts_lidar, V2C, R0):
++    """
++    :param pts_lidar: (N, 3)
++    :return pts_rect: (N, 3)
++    """
++    pts_lidar_hom = cart_to_hom_numba(pts_lidar)
++    pts_rect = np.dot(pts_lidar_hom, np.dot(V2C.T, R0.T))
++    return pts_rect
++
++@numba.jit(nopython=True)
++def get_fov_flag_numba(pts_rect, img_shape, P2):
++    """
++    Args:
++        pts_rect:
++        img_shape:
++        calib:
++
++    Returns:
++
++    """
++    #pts_img, pts_rect_depth = rect_to_img_numba(pts_rect)
++    pts_rect_hom = cart_to_hom_numba(pts_rect)
++    pts_2d_hom = np.dot(pts_rect_hom, P2.T)
++    pts_img = (pts_2d_hom[:, 0:2].T / pts_rect_hom[:, 2]).T  # (N, 2)
++    pts_rect_depth = pts_2d_hom[:, 2] - P2.T[3, 2]  # depth in rect camera coord
++    #return pts_img, pts_rect_depth
++
++    val_flag_1 = np.logical_and(pts_img[:, 0] >= 0, pts_img[:, 0] < img_shape[1])
++    val_flag_2 = np.logical_and(pts_img[:, 1] >= 0, pts_img[:, 1] < img_shape[0])
++    val_flag_merge = np.logical_and(val_flag_1, val_flag_2)
++    pts_valid_flag = np.logical_and(val_flag_merge, pts_rect_depth >= 0)
++
++    return pts_valid_flag
+ 
+ def create_kitti_infos(dataset_cfg, class_names, data_path, save_path, workers=4):
+     dataset = KittiDataset(dataset_cfg=dataset_cfg, class_names=class_names, root_path=data_path, training=False)
+diff --git a/pcdet/datasets/kitti/kitti_object_eval_python/eval.py b/pcdet/datasets/kitti/kitti_object_eval_python/eval.py
+index 1d2a317..a3a3028 100644
+--- a/pcdet/datasets/kitti/kitti_object_eval_python/eval.py
++++ b/pcdet/datasets/kitti/kitti_object_eval_python/eval.py
+@@ -3,7 +3,7 @@ import io as sysio
+ import numba
+ import numpy as np
+ 
+-from .rotate_iou import rotate_iou_gpu_eval
++#from .rotate_iou import rotate_iou_gpu_eval
+ 
+ 
+ @numba.jit
+diff --git a/pcdet/datasets/processor/data_processor.py b/pcdet/datasets/processor/data_processor.py
+index 84f4b87..0225db1 100644
+--- a/pcdet/datasets/processor/data_processor.py
++++ b/pcdet/datasets/processor/data_processor.py
+@@ -3,7 +3,7 @@ from functools import partial
+ import numpy as np
+ 
+ from ...utils import box_utils, common_utils
+-
++from . import voxel_generator2
+ 
+ class DataProcessor(object):
+     def __init__(self, processor_configs, point_cloud_range, training):
+@@ -20,7 +20,7 @@ class DataProcessor(object):
+         if data_dict is None:
+             return partial(self.mask_points_and_boxes_outside_range, config=config)
+         mask = common_utils.mask_points_by_range(data_dict['points'], self.point_cloud_range)
+-        data_dict['points'] = data_dict['points'][mask]
++        #data_dict['points'] = data_dict['points'][mask]
+         if data_dict.get('gt_boxes', None) is not None and config.REMOVE_OUTSIDE_BOXES and self.training:
+             mask = box_utils.mask_boxes_outside_range_numpy(
+                 data_dict['gt_boxes'], self.point_cloud_range, min_num_corners=config.get('min_num_corners', 1)
+@@ -42,6 +42,7 @@ class DataProcessor(object):
+ 
+     def transform_points_to_voxels(self, data_dict=None, config=None, voxel_generator=None):
+         if data_dict is None:
++            '''
+             try:
+                 from spconv.utils import VoxelGeneratorV2 as VoxelGenerator
+             except:
+@@ -53,13 +54,18 @@ class DataProcessor(object):
+                 max_num_points=config.MAX_POINTS_PER_VOXEL,
+                 max_voxels=config.MAX_NUMBER_OF_VOXELS[self.mode]
+             )
++            '''
+             grid_size = (self.point_cloud_range[3:6] - self.point_cloud_range[0:3]) / np.array(config.VOXEL_SIZE)
+             self.grid_size = np.round(grid_size).astype(np.int64)
+             self.voxel_size = config.VOXEL_SIZE
+-            return partial(self.transform_points_to_voxels, voxel_generator=voxel_generator)
+-
++            self.max_num_points = config.MAX_POINTS_PER_VOXEL
++            self.max_voxels = config.MAX_NUMBER_OF_VOXELS[self.mode]
++            return partial(self.transform_points_to_voxels, voxel_generator=None)
+         points = data_dict['points']
+-        voxel_output = voxel_generator.generate(points)
++        voxelsize = np.array(self.voxel_size)
++        voxel_output = \
++            voxel_generator2.generate(points, voxelsize, self.point_cloud_range, self.max_num_points, self.max_voxels)
++
+         if isinstance(voxel_output, dict):
+             voxels, coordinates, num_points = \
+                 voxel_output['voxels'], voxel_output['coordinates'], voxel_output['num_points_per_voxel']
+@@ -69,6 +75,9 @@ class DataProcessor(object):
+         if not data_dict['use_lead_xyz']:
+             voxels = voxels[..., 3:]  # remove xyz in voxels(N, 3)
+ 
++        data_dict['voxel_size'] = self.voxel_size
++        data_dict['point_cloud_range'] = self.point_cloud_range
++        data_dict['grid_size'] = self.grid_size
+         data_dict['voxels'] = voxels
+         data_dict['voxel_coords'] = coordinates
+         data_dict['voxel_num_points'] = num_points
+diff --git a/pcdet/datasets/processor/voxel_generator2.py b/pcdet/datasets/processor/voxel_generator2.py
+new file mode 100644
+index 0000000..3137876
+--- /dev/null
++++ b/pcdet/datasets/processor/voxel_generator2.py
+@@ -0,0 +1,178 @@
++import numba
++import numpy as np
++
++@numba.jit(nopython=True)
++def _points_to_voxel_reverse_kernel(points,
++                                    voxel_size,
++                                    coors_range,
++                                    num_points_per_voxel,
++                                    coor_to_voxelidx,
++                                    voxels,
++                                    coors,
++                                    max_points=35,
++                                    max_voxels=20000):
++    # put all computations to one loop.
++    # we shouldn't create large array in main jit code, otherwise
++    # reduce performance
++    #points.tofile("points_openD.bin")
++    N = points.shape[0]
++    # ndim = points.shape[1] - 1
++    ndim = 3
++    ndim_minus_1 = ndim - 1
++    grid_size = (coors_range[3:] - coors_range[:3]) / voxel_size
++    # np.round(grid_size)
++    # grid_size = np.round(grid_size).astype(np.int64)(np.int32)
++    grid_size = np.round(grid_size, 0, grid_size).astype(np.int32)
++    coor = np.zeros(shape=(3, ), dtype=np.int32)
++    voxel_num = 0
++    failed = False
++    for i in range(N):
++        #print("---------%.f" % (i))
++        failed = False
++ 
++        for j in range(ndim):
++            #if i == 465:
++            #    print("point %.10f, minus %.10f, res %.10f, " % (points[i, j], points[i, j] - coors_range[j], (points[i, j] - coors_range[j]) / voxel_size[j]))
++            c = np.floor((points[i, j] - coors_range[j]) / voxel_size[j])
++            #print(c)
++            if c < 0 or c >= grid_size[j]:
++                failed = True
++                break
++            coor[ndim_minus_1 - j] = c
++        if failed:
++            continue
++        voxelidx = coor_to_voxelidx[coor[0], coor[1], coor[2]]
++        if voxelidx == -1:
++            voxelidx = voxel_num
++            if voxel_num >= max_voxels:
++                break
++            voxel_num += 1
++            coor_to_voxelidx[coor[0], coor[1], coor[2]] = voxelidx
++            coors[voxelidx] = coor
++        num = num_points_per_voxel[voxelidx]
++        if num < max_points:
++            voxels[voxelidx, num] = points[i]
++            num_points_per_voxel[voxelidx] += 1
++    #coors.tofile("coor_openPCD.bin")
++    #coor_to_voxelidx = coor_to_voxelidx + 1
++    #coor_to_voxelidx.tofile("id_openPCD.bin")
++    return voxel_num
++
++@numba.jit(nopython=True)
++def _points_to_voxel_kernel(points,
++                            voxel_size,
++                            coors_range,
++                            num_points_per_voxel,
++                            coor_to_voxelidx,
++                            voxels,
++                            coors,
++                            max_points=35,
++                            max_voxels=20000):
++    # need mutex if write in cuda, but numba.cuda don't support mutex.
++    # in addition, pytorch don't support cuda in dataloader(tensorflow support this).
++    # put all computations to one loop.
++    # we shouldn't create large array in main jit code, otherwise
++    # decrease performance
++    N = points.shape[0]
++    # ndim = points.shape[1] - 1
++    ndim = 3
++    grid_size = (coors_range[3:] - coors_range[:3]) / voxel_size
++    # grid_size = np.round(grid_size).astype(np.int64)(np.int32)
++    grid_size = np.round(grid_size, 0, grid_size).astype(np.int32)
++
++    lower_bound = coors_range[:3]
++    upper_bound = coors_range[3:]
++    coor = np.zeros(shape=(3, ), dtype=np.int32)
++    voxel_num = 0
++    failed = False
++    for i in range(N):
++        failed = False
++        for j in range(ndim):
++            c = np.floor((points[i, j] - coors_range[j]) / voxel_size[j])
++            if c < 0 or c >= grid_size[j]:
++                failed = True
++                break
++            coor[j] = c
++        if failed:
++            continue
++        voxelidx = coor_to_voxelidx[coor[0], coor[1], coor[2]]
++        if voxelidx == -1:
++            voxelidx = voxel_num
++            if voxel_num >= max_voxels:
++                break
++            voxel_num += 1
++            coor_to_voxelidx[coor[0], coor[1], coor[2]] = voxelidx
++            coors[voxelidx] = coor
++        num = num_points_per_voxel[voxelidx]
++        if num < max_points:
++            voxels[voxelidx, num] = points[i]
++            num_points_per_voxel[voxelidx] += 1
++    return voxel_num
++
++def points_to_voxel(points,
++                     voxel_size,
++                     coors_range,
++                     max_points=35,
++                     reverse_index=True,
++                     max_voxels=20000):
++    """convert kitti points(N, >=3) to voxels. This version calculate
++    everything in one loop. now it takes only 4.2ms(complete point cloud) 
++    with jit and 3.2ghz cpu.(don't calculate other features)
++    Note: this function in ubuntu seems faster than windows 10.
++
++    Args:
++        points: [N, ndim] float tensor. points[:, :3] contain xyz points and
++            points[:, 3:] contain other information such as reflectivity.
++        voxel_size: [3] list/tuple or array, float. xyz, indicate voxel size
++        coors_range: [6] list/tuple or array, float. indicate voxel range.
++            format: xyzxyz, minmax
++        max_points: int. indicate maximum points contained in a voxel.
++        reverse_index: boolean. indicate whether return reversed coordinates.
++            if points has xyz format and reverse_index is True, output 
++            coordinates will be zyx format, but points in features always
++            xyz format.
++        max_voxels: int. indicate maximum voxels this function create.
++            for second, 20000 is a good choice. you should shuffle points
++            before call this function because max_voxels may drop some points.
++
++    Returns:
++        voxels: [M, max_points, ndim] float tensor. only contain points.
++        coordinates: [M, 3] int32 tensor.
++        num_points_per_voxel: [M] int32 tensor.
++    """
++    if not isinstance(voxel_size, np.ndarray):
++        voxel_size = np.array(voxel_size, dtype=points.dtype)
++    if not isinstance(coors_range, np.ndarray):
++        coors_range = np.array(coors_range, dtype=points.dtype)
++    voxelmap_shape = (coors_range[3:] - coors_range[:3]) / voxel_size
++    voxelmap_shape = tuple(np.round(voxelmap_shape).astype(np.int32).tolist())
++    if reverse_index:
++        voxelmap_shape = voxelmap_shape[::-1]
++    # don't create large array in jit(nopython=True) code.
++    num_points_per_voxel = np.zeros(shape=(max_voxels, ), dtype=np.int32)
++    coor_to_voxelidx = -np.ones(shape=voxelmap_shape, dtype=np.int32)
++    voxels = np.zeros(
++        shape=(max_voxels, max_points, points.shape[-1]), dtype=points.dtype)
++    coors = np.zeros(shape=(max_voxels, 3), dtype=np.int32)
++    if reverse_index:
++        voxel_num = _points_to_voxel_reverse_kernel(
++            points, voxel_size, coors_range, num_points_per_voxel,
++            coor_to_voxelidx, voxels, coors, max_points, max_voxels)
++
++    else:
++        voxel_num = _points_to_voxel_kernel(
++            points, voxel_size, coors_range, num_points_per_voxel,
++            coor_to_voxelidx, voxels, coors, max_points, max_voxels)
++
++    coors = coors[:voxel_num]
++    voxels = voxels[:voxel_num]
++    num_points_per_voxel = num_points_per_voxel[:voxel_num]
++    # voxels[:, :, -3:] = voxels[:, :, :3] - \
++    #     voxels[:, :, :3].sum(axis=1, keepdims=True)/num_points_per_voxel.reshape(-1, 1, 1)
++    return voxels, coors, num_points_per_voxel
++
++def generate(points, voxel_size, point_cloud_range, max_num_points, max_voxels):
++    return points_to_voxel(
++        points, voxel_size, point_cloud_range,
++        max_num_points, True, max_voxels)
++
+diff --git a/pcdet/models/__init__.py b/pcdet/models/__init__.py
+index bc9a2f2..367a6ca 100644
+--- a/pcdet/models/__init__.py
++++ b/pcdet/models/__init__.py
+@@ -19,7 +19,7 @@ def load_data_to_gpu(batch_dict):
+             continue
+         if key in ['frame_id', 'metadata', 'calib', 'image_shape']:
+             continue
+-        batch_dict[key] = torch.from_numpy(val).float().cuda()
++        batch_dict[key] = torch.from_numpy(val).float()
+ 
+ 
+ def model_fn_decorator():
+diff --git a/pcdet/models/backbones_2d/base_bev_backbone.py b/pcdet/models/backbones_2d/base_bev_backbone.py
+index 07fe70f..4a18c5f 100644
+--- a/pcdet/models/backbones_2d/base_bev_backbone.py
++++ b/pcdet/models/backbones_2d/base_bev_backbone.py
+@@ -1,10 +1,14 @@
+ import numpy as np
+ import torch
+ import torch.nn as nn
++import threading
++from pathlib import Path
+ 
++#BaseBEVBackbone_ASYNC=False
++BaseBEVBackbone_ASYNC=True
+ 
+ class BaseBEVBackbone(nn.Module):
+-    def __init__(self, model_cfg, input_channels):
++    def __init__(self, model_cfg, input_channels, openvino_ie):
+         super().__init__()
+         self.model_cfg = model_cfg
+ 
+@@ -78,7 +82,17 @@ class BaseBEVBackbone(nn.Module):
+ 
+         self.num_bev_features = c_in
+ 
+-    def forward(self, data_dict):
++        self.frame_id = 0
++        self.event = threading.Event()
++        self.queue = []
++
++        self.ie = openvino_ie
++        model_file_rpn = str(Path(__file__).resolve().parents[3] / 'tools'/'rpn.xml')
++        model_weight_rpn = str(Path(__file__).resolve().parents[3] / 'tools'/'rpn.bin')
++        self.net_rpn = openvino_ie.read_network(model_file_rpn, model_weight_rpn)
++        self.exec_net_rpn = openvino_ie.load_network(network=self.net_rpn, device_name="GPU")
++
++    def forward_backbone2d(self, data_dict):
+         """
+         Args:
+             data_dict:
+@@ -110,3 +124,53 @@ class BaseBEVBackbone(nn.Module):
+         data_dict['spatial_features_2d'] = x
+ 
+         return data_dict
++
++    def callback(self, statusCode, userdata):
++        request, request_id, data_dict = userdata
++        #print ("exec rpn net call back {}".format(request_id))
++        res = request.output_blobs
++        for k, v in res.items():
++            if k == "184":
++                data_dict['batch_box_preds'] = torch.as_tensor(v.buffer)
++            elif k == "185":
++                data_dict['batch_cls_preds'] = torch.as_tensor(v.buffer)
++            elif k == "187":
++                data_dict['dir_cls_preds'] = torch.as_tensor(v.buffer)
++        self.queue.append(data_dict)
++        self.event.set()
++
++    def forward(self, data_dict):
++        raise NotImplementedError
++
++    def preprocessing(self, data_dict, **kwargs):
++        input_blob = next(iter(self.exec_net_rpn.input_info))
++        return {input_blob: data_dict['spatial_features']}
++
++    def sync_call(self, data_dict):
++        #start_time = time.perf_counter()
++        inputs_param = self.preprocessing(data_dict)
++        request = self.exec_net_rpn.requests[0]
++        res = self.exec_net_rpn.infer(inputs=inputs_param)
++        for k, v in res.items():
++            if k == "184":
++                data_dict['batch_box_preds'] = torch.as_tensor(v)
++            elif k == "185":
++                data_dict['batch_cls_preds'] = torch.as_tensor(v)
++            elif k == "187":
++                data_dict['dir_cls_preds'] = torch.as_tensor(v)
++        return data_dict
++
++    def postprocessing(self):
++        self.event.wait()
++        return self.queue.pop(0)
++
++    def async_call(self, batch_dict, inputs_param):
++        self.frame_id = self.frame_id + 1
++        request = self.exec_net_rpn.requests[0]
++        request.set_completion_callback(py_callback=self.callback,
++                                    py_data=(request, self.frame_id, batch_dict))
++        self.event.clear()
++        #print ("exec rpn net forward back {}".format(self.frame_id))
++        request.async_infer(inputs=inputs_param)
++        return
++
+diff --git a/pcdet/models/backbones_2d/map_to_bev/pointpillar_scatter.py b/pcdet/models/backbones_2d/map_to_bev/pointpillar_scatter.py
+index 93305f9..d0d60bd 100644
+--- a/pcdet/models/backbones_2d/map_to_bev/pointpillar_scatter.py
++++ b/pcdet/models/backbones_2d/map_to_bev/pointpillar_scatter.py
+@@ -1,6 +1,21 @@
+ import torch
+ import torch.nn as nn
++import numpy as np
++import numba
+ 
++@numba.jit(nopython=True, parallel=True)
++def calculate(spatial_feature, pillars, indices):
++    for i in numba.prange(spatial_feature.shape[0]):
++        for j in numba.prange(indices.shape[0]):
++            spatial_feature[i][indices[j]] = pillars[i][j]
++    return spatial_feature
++
++#ENABLE_NUMBA=True
++ENABLE_NUMBA=False
++if ENABLE_NUMBA:
++    numba.config.THREADING_LAYER = 'tbb'
++
++ENABLE_NUMBA_DEBUG_PRINT=False
+ 
+ class PointPillarScatter(nn.Module):
+     def __init__(self, model_cfg, grid_size, **kwargs):
+@@ -15,23 +30,35 @@ class PointPillarScatter(nn.Module):
+         pillar_features, coords = batch_dict['pillar_features'], batch_dict['voxel_coords']
+         batch_spatial_features = []
+         batch_size = coords[:, 0].max().int().item() + 1
+-        for batch_idx in range(batch_size):
+-            spatial_feature = torch.zeros(
+-                self.num_bev_features,
+-                self.nz * self.nx * self.ny,
+-                dtype=pillar_features.dtype,
+-                device=pillar_features.device)
+-
+-            batch_mask = coords[:, 0] == batch_idx
+-            this_coords = coords[batch_mask, :]
+-            indices = this_coords[:, 1] + this_coords[:, 2] * self.nx + this_coords[:, 3]
+-            indices = indices.type(torch.long)
+-            pillars = pillar_features[batch_mask, :]
+-            pillars = pillars.t()
++        if batch_size != 1:
++            raise NotImplementedError
++
++        spatial_feature = np.zeros((self.num_bev_features,self.nz * self.nx * self.ny), dtype=np.float32)
++        batch_mask = coords[:, 0] == 0
++        this_coords = coords[batch_mask, :]
++        indices = this_coords[:, 1] + this_coords[:, 2] * self.nx + this_coords[:, 3]
++        indices = indices.type(torch.long)
++        batchmask = batch_mask.numpy()
++        len_mask = batchmask.shape[0]
++        if len_mask < 12000:
++            batchmask_pad = np.pad(batchmask, (0,12000-len_mask), 'constant',constant_values=False)
++        else:
++            batchmask_pad = batchmask[:12000]
++        batch_mask_tensor = torch.from_numpy(batchmask_pad)
++        pillars = pillar_features[batch_mask_tensor, :]
++        pillars = pillars.t()
++
++        if ENABLE_NUMBA is True:
++            spatial_feature = calculate(spatial_feature, pillars.numpy(), indices.numpy())
++            spatial_feature = torch.from_numpy(spatial_feature)
++            if ENABLE_NUMBA_DEBUG_PRINT is True:
++                print("Threading layer chosen: %s" % numba.threading_layer())
++                calculate.parallel_diagnostics(level=4)
++                exit(0)
++        else:
++            spatial_feature = torch.from_numpy(spatial_feature)
+             spatial_feature[:, indices] = pillars
+-            batch_spatial_features.append(spatial_feature)
+ 
+-        batch_spatial_features = torch.stack(batch_spatial_features, 0)
+-        batch_spatial_features = batch_spatial_features.view(batch_size, self.num_bev_features * self.nz, self.ny, self.nx)
++        batch_spatial_features = spatial_feature.view(batch_size, self.num_bev_features * self.nz, self.ny, self.nx)
+         batch_dict['spatial_features'] = batch_spatial_features
+         return batch_dict
+diff --git a/pcdet/models/backbones_3d/__init__.py b/pcdet/models/backbones_3d/__init__.py
+index bc1347d..2ef63e7 100644
+--- a/pcdet/models/backbones_3d/__init__.py
++++ b/pcdet/models/backbones_3d/__init__.py
+@@ -1,11 +1,2 @@
+-from .pointnet2_backbone import PointNet2Backbone, PointNet2MSG
+-from .spconv_backbone import VoxelBackBone8x, VoxelResBackBone8x
+-from .spconv_unet import UNetV2
+-
+ __all__ = {
+-    'VoxelBackBone8x': VoxelBackBone8x,
+-    'UNetV2': UNetV2,
+-    'PointNet2Backbone': PointNet2Backbone,
+-    'PointNet2MSG': PointNet2MSG,
+-    'VoxelResBackBone8x': VoxelResBackBone8x,
+ }
+diff --git a/pcdet/models/backbones_3d/vfe/pillar_vfe.py b/pcdet/models/backbones_3d/vfe/pillar_vfe.py
+index 40b049d..4be8989 100644
+--- a/pcdet/models/backbones_3d/vfe/pillar_vfe.py
++++ b/pcdet/models/backbones_3d/vfe/pillar_vfe.py
+@@ -1,8 +1,12 @@
+ import torch
+ import torch.nn as nn
+ import torch.nn.functional as F
++import time
++import numpy as np
+ 
+ from .vfe_template import VFETemplate
++import threading
++from pathlib import Path
+ 
+ 
+ class PFNLayer(nn.Module):
+@@ -50,7 +54,7 @@ class PFNLayer(nn.Module):
+ 
+ 
+ class PillarVFE(VFETemplate):
+-    def __init__(self, model_cfg, num_point_features, voxel_size, point_cloud_range):
++    def __init__(self, model_cfg, num_point_features, voxel_size, point_cloud_range, openvino_ie):
+         super().__init__(model_cfg=model_cfg)
+ 
+         self.use_norm = self.model_cfg.USE_NORM
+@@ -80,6 +84,19 @@ class PillarVFE(VFETemplate):
+         self.y_offset = self.voxel_y / 2 + point_cloud_range[1]
+         self.z_offset = self.voxel_z / 2 + point_cloud_range[2]
+ 
++        #ie = IECore()
++        #self.ie = ie
++        #self.ie = openvino_ie
++        model_file_pfe = str(Path(__file__).resolve().parents[4] / 'tools'/'pfe.xml')
++        model_weight_pfe = str(Path(__file__).resolve().parents[4] / 'tools'/'pfe.bin')
++        self.net_pfe = openvino_ie.read_network(model_file_pfe, model_weight_pfe)
++        self.exec_net_pfe = openvino_ie.load_network(network=self.net_pfe, device_name="GPU")
++
++        self.frame_id = 0
++        self.event = threading.Event()
++        self.queue = []
++
++
+     def get_output_feature_dim(self):
+         return self.num_filters[-1]
+ 
+@@ -91,8 +108,146 @@ class PillarVFE(VFETemplate):
+         paddings_indicator = actual_num.int() > max_num
+         return paddings_indicator
+ 
+-    def forward(self, batch_dict, **kwargs):
+-  
++    def preprocessing(self, batch_dict, **kwargs):
++        voxel_features, voxel_num_points, coords = batch_dict['voxels'], batch_dict['voxel_num_points'], batch_dict['voxel_coords']
++        #start_time = time.perf_counter()
++
++        coors_x = coords[:, 3].float()
++        coors_y = coords[:, 2].float()
++        x_sub = coors_x.unsqueeze(1) * 0.16 + 0.1
++        y_sub = coors_y.unsqueeze(1) * 0.16 + -39.9
++        ones = torch.ones([1, 100], dtype=torch.float32, device="cpu")
++        x_sub_shaped = torch.mm(x_sub, ones).unsqueeze(0).unsqueeze(0)
++        y_sub_shaped = torch.mm(y_sub, ones).unsqueeze(0).unsqueeze(0)
++
++        voxel_count = voxel_features.shape[1]
++        mask = self.get_paddings_indicator(voxel_num_points, voxel_count, axis=0)
++        mask = torch.unsqueeze(mask, 0).type_as(voxel_features)
++        mask = torch.unsqueeze(mask, 0).type_as(voxel_features)
++
++        pillar_x = voxel_features[:, :, 0].unsqueeze(0).unsqueeze(0)
++        pillar_y = voxel_features[:, :, 1].unsqueeze(0).unsqueeze(0)
++        pillar_z = voxel_features[:, :, 2].unsqueeze(0).unsqueeze(0)
++        pillar_i = voxel_features[:, :, 3].unsqueeze(0).unsqueeze(0)
++        num_points = voxel_num_points.float().unsqueeze(0)
++
++        pillarx = pillar_x.numpy()
++        pillary = pillar_y.numpy()
++        pillarz = pillar_z.numpy()
++        pillari = pillar_i.numpy()
++        numpoints = num_points.numpy()
++        xsub_shaped = x_sub_shaped.numpy()
++        ysub_shaped = y_sub_shaped.numpy()
++        mask_np = mask.numpy()
++
++        pillar_len = pillarx.shape[2]
++        if pillar_len < 12000:
++            len_padding = 12000 - pillar_len
++            pillarx_pad = np.pad(pillarx, ((0,0),(0,0),(0,len_padding),(0,0)),'constant',constant_values=0)
++            pillary_pad = np.pad(pillary, ((0,0),(0,0),(0,len_padding),(0,0)),'constant',constant_values=0)
++            pillarz_pad = np.pad(pillarz, ((0,0),(0,0),(0,len_padding),(0,0)),'constant',constant_values=0)
++            pillari_pad = np.pad(pillari, ((0,0),(0,0),(0,len_padding),(0,0)),'constant',constant_values=0)
++            nump_pad = np.pad(numpoints, ((0,0),(0,len_padding)),'constant',constant_values=0)
++            xsub_pad = np.pad(xsub_shaped, ((0,0),(0,0),(0,len_padding),(0,0)),'constant',constant_values=0)
++            ysub_pad = np.pad(ysub_shaped, ((0,0),(0,0),(0,len_padding),(0,0)),'constant',constant_values=0)
++            mask_pad = np.pad(mask_np, ((0,0),(0,0),(0,len_padding),(0,0)),'constant',constant_values=0)
++        else:
++            pillarx_pad = pillarx[:,:,:12000,:]
++            pillary_pad = pillary[:,:,:12000,:]
++            pillarz_pad = pillarz[:,:,:12000,:]
++            pillari_pad = pillari[:,:,:12000,:]
++            nump_pad = numpoints[:,:12000]
++            xsub_pad = xsub_shaped[:,:,:12000,:]
++            ysub_pad = ysub_shaped[:,:,:12000,:]
++            mask_pad = mask_np[:,:,:12000,:]
++        
++        pillar_x_tensor =  torch.from_numpy(pillarx_pad)
++        pillar_y_tensor =  torch.from_numpy(pillary_pad)
++        pillar_z_tensor =  torch.from_numpy(pillarz_pad)
++        pillar_i_tensor =  torch.from_numpy(pillari_pad)
++        num_points_tensor =  torch.from_numpy(nump_pad)
++        x_sub_shaped_tensor =  torch.from_numpy(xsub_pad)
++        y_sub_shaped_tensor =  torch.from_numpy(ysub_pad)
++        mask_tensor =  torch.from_numpy(mask_pad)
++
++        #start_time = time.perf_counter()
++        #net = self.net_pfe
++        #ie = self.ie
++        #input_blob = next(iter(net.input_info))
++        #shape1 = net.input_info["pillar_x"].input_data.shape
++        #net.reshape({'pillar_x':pillar_x.shape,
++        #             'pillar_y':pillar_y.shape,
++        #             'pillar_z':pillar_z.shape,
++        #             'pillar_i':pillar_i.shape,
++        #             'num_points_per_pillar':num_points.shape,
++        #             'x_sub_shaped':x_sub_shaped.shape,
++        #             'y_sub_shaped':y_sub_shaped.shape,
++        #             'mask':mask.shape})
++        #shape2 = net.input_info["pillar_x"].input_data.shape
++        #exec_net_pfe = ie.load_network(network=net, device_name="CPU")
++        #print('pfe_openvino load: %.2fms' %((time.perf_counter() - start_time)*1000))
++        #print('pfe_openvino prepare: %.2fms' %((time.perf_counter() - start_time)*1000))
++        inputs = {'pillar_x': pillar_x_tensor,
++                                     'pillar_y': pillar_y_tensor,
++                                     'pillar_z': pillar_z_tensor,
++                                     'pillar_i': pillar_i_tensor,
++                                     'num_points_per_pillar': num_points_tensor,
++                                     'x_sub_shaped': x_sub_shaped_tensor,
++                                     'y_sub_shaped': y_sub_shaped_tensor,
++                                     'mask': mask_tensor}
++        return inputs
++
++    def forward(self, data_dict):
++        raise NotImplementedError
++
++    def sync_call(self, batch_dict):
++        inputs_param = self.preprocessing(batch_dict)
++        exec_net = self.exec_net_pfe
++        #start_time = time.perf_counter()
++
++        res = exec_net.infer(inputs=inputs_param)
++        for k, v in res.items():
++            if k == "174":
++                res_torch = torch.as_tensor(v)
++        voxel_features = res_torch.squeeze()
++        voxel_features = voxel_features.permute(1, 0)
++        batch_dict['pillar_features'] = voxel_features
++        return batch_dict
++
++    def async_call(self, batch_dict, inputs_param):
++        self.frame_id = self.frame_id + 1
++        request = self.exec_net_pfe.requests[0]
++        request.set_completion_callback(py_callback=self.callback,
++                                    py_data=(request, self.frame_id, batch_dict))
++        self.event.clear()
++        #print ("exec pfe net forward {}".format(self.frame_id))
++        request.async_infer(inputs=inputs_param)
++        return
++
++    def postprocessing(self):
++        self.event.wait()
++        return self.queue.pop(0)
++
++    def callback(self, statusCode, userdata):
++        request, request_id, data_dict = userdata
++        res = request.output_blobs
++        for k, v in res.items():
++            if k == "174":
++                res_torch = torch.as_tensor(v.buffer)
++
++        voxel_features = res_torch.squeeze()
++        voxel_features = voxel_features.permute(1, 0)
++        data_dict['pillar_features'] = voxel_features
++        #voxelfeatures = voxel_features.numpy()
++        #voxelfeatures.tofile("vfe_openPCD.bin")
++        #print('pfe_openvino infer: %.2fms' %((time.perf_counter() - start_time)*1000))
++        self.queue.append(data_dict)
++        #print ("exec pfe net call back {}".format(request_id))
++        self.event.set()
++
++    def forward_vfe(self, batch_dict, **kwargs):
++        start_time = time.perf_counter()
++
+         voxel_features, voxel_num_points, coords = batch_dict['voxels'], batch_dict['voxel_num_points'], batch_dict['voxel_coords']
+         points_mean = voxel_features[:, :, :3].sum(dim=1, keepdim=True) / voxel_num_points.type_as(voxel_features).view(-1, 1, 1)
+         f_cluster = voxel_features[:, :, :3] - points_mean
+diff --git a/pcdet/models/dense_heads/__init__.py b/pcdet/models/dense_heads/__init__.py
+index 7eac80d..c4abb4f 100644
+--- a/pcdet/models/dense_heads/__init__.py
++++ b/pcdet/models/dense_heads/__init__.py
+@@ -1,15 +1,7 @@
+-from .anchor_head_multi import AnchorHeadMulti
+ from .anchor_head_single import AnchorHeadSingle
+ from .anchor_head_template import AnchorHeadTemplate
+-from .point_head_box import PointHeadBox
+-from .point_head_simple import PointHeadSimple
+-from .point_intra_part_head import PointIntraPartOffsetHead
+ 
+ __all__ = {
+     'AnchorHeadTemplate': AnchorHeadTemplate,
+     'AnchorHeadSingle': AnchorHeadSingle,
+-    'PointIntraPartOffsetHead': PointIntraPartOffsetHead,
+-    'PointHeadSimple': PointHeadSimple,
+-    'PointHeadBox': PointHeadBox,
+-    'AnchorHeadMulti': AnchorHeadMulti,
+ }
+diff --git a/pcdet/models/dense_heads/anchor_head_single.py b/pcdet/models/dense_heads/anchor_head_single.py
+index 83c62cc..b06246d 100644
+--- a/pcdet/models/dense_heads/anchor_head_single.py
++++ b/pcdet/models/dense_heads/anchor_head_single.py
+@@ -2,6 +2,7 @@ import numpy as np
+ import torch.nn as nn
+ 
+ from .anchor_head_template import AnchorHeadTemplate
++from ...utils import box_utils
+ 
+ 
+ class AnchorHeadSingle(AnchorHeadTemplate):
+@@ -38,7 +39,7 @@ class AnchorHeadSingle(AnchorHeadTemplate):
+         nn.init.constant_(self.conv_cls.bias, -np.log((1 - pi) / pi))
+         nn.init.normal_(self.conv_box.weight, mean=0, std=0.001)
+ 
+-    def forward(self, data_dict):
++    def forward_anchorhead(self, data_dict):
+         spatial_features_2d = data_dict['spatial_features_2d']
+ 
+         cls_preds = self.conv_cls(spatial_features_2d)
+@@ -73,3 +74,60 @@ class AnchorHeadSingle(AnchorHeadTemplate):
+             data_dict['cls_preds_normalized'] = False
+ 
+         return data_dict
++
++    def forward(self, data_dict):
++        cls_preds = data_dict['batch_cls_preds']
++        box_preds = data_dict['batch_box_preds']
++        dir_cls_preds = data_dict['dir_cls_preds']
++        #boxpreds = box_preds.numpy()
++        #boxpreds.tofile("box_openPCD.bin")
++        #clspreds = cls_preds.numpy()
++        #clspreds.tofile("cls_openPCD.bin")
++        #start_time = time.perf_counter()
++        if not self.training or self.predict_boxes_when_training:
++            batch_cls_preds, batch_box_preds = self.generate_predicted_boxes(
++                batch_size=data_dict['batch_size'],
++                cls_preds=cls_preds, box_preds=box_preds, dir_cls_preds=dir_cls_preds
++            )
++            data_dict['batch_cls_preds'] = batch_cls_preds
++            data_dict['batch_box_preds'] = batch_box_preds
++            data_dict['cls_preds_normalized'] = False
++
++        anchors = self.anchors
++        anchors = anchors[0].reshape([-1, 7])
++        anchors_bv = box_utils.rbbox2d_to_near_bbox(
++            anchors[:, [0, 1, 3, 4, 6]])
++
++        anchors_mask = None
++        anchor_area_threshold = 1
++        coors = data_dict['voxel_coords'].int()
++        coors = coors[:, 1:]
++        coor = coors.numpy()
++
++        grid_size = data_dict['grid_size'].int()
++        grid_size = grid_size.view(-1)
++        gridsize = grid_size.numpy()
++
++        voxel_size = data_dict['voxel_size']
++        voxel_size = voxel_size.view(-1)
++        voxelsize = voxel_size.numpy()
++
++        pc_range = data_dict['point_cloud_range']
++        pc_range = pc_range.view(-1)
++        pcrange = pc_range.numpy()
++
++        dense_voxel_map = box_utils.sparse_sum_for_anchors_mask(
++            coor, tuple(gridsize[::-1][1:]))
++        dense_voxel_map = dense_voxel_map.cumsum(0)
++        dense_voxel_map = dense_voxel_map.cumsum(1)
++        anchors_area = box_utils.fused_get_anchors_area(
++            dense_voxel_map, anchors_bv, voxelsize, pcrange, gridsize)
++        anchors_mask = anchors_area > anchor_area_threshold
++        #example['anchors_mask'] = anchors_mask.astype(np.uint8)
++        #example['anchors_mask'] = anchors_mask
++
++        data_dict['anchor_mask'] = anchors_mask
++        #print('AnchorHeadSingle: %.2fms' %((time.perf_counter() - start_time)*1000))
++
++        return data_dict
++
+diff --git a/pcdet/models/dense_heads/anchor_head_template.py b/pcdet/models/dense_heads/anchor_head_template.py
+index db8167a..b9983f2 100644
+--- a/pcdet/models/dense_heads/anchor_head_template.py
++++ b/pcdet/models/dense_heads/anchor_head_template.py
+@@ -28,7 +28,7 @@ class AnchorHeadTemplate(nn.Module):
+             anchor_generator_cfg, grid_size=grid_size, point_cloud_range=point_cloud_range,
+             anchor_ndim=self.box_coder.code_size
+         )
+-        self.anchors = [x.cuda() for x in anchors]
++        self.anchors = [x for x in anchors]
+         self.target_assigner = self.get_target_assigner(anchor_target_cfg)
+ 
+         self.forward_ret_dict = {}
+diff --git a/pcdet/models/dense_heads/target_assigner/anchor_generator.py b/pcdet/models/dense_heads/target_assigner/anchor_generator.py
+index 0aa6861..76a8ad9 100644
+--- a/pcdet/models/dense_heads/target_assigner/anchor_generator.py
++++ b/pcdet/models/dense_heads/target_assigner/anchor_generator.py
+@@ -33,10 +33,10 @@ class AnchorGenerator(object):
+ 
+             x_shifts = torch.arange(
+                 self.anchor_range[0] + x_offset, self.anchor_range[3] + 1e-5, step=x_stride, dtype=torch.float32,
+-            ).cuda()
++            )
+             y_shifts = torch.arange(
+                 self.anchor_range[1] + y_offset, self.anchor_range[4] + 1e-5, step=y_stride, dtype=torch.float32,
+-            ).cuda()
++            )
+             z_shifts = x_shifts.new_tensor(anchor_height)
+ 
+             num_anchor_size, num_anchor_rotation = anchor_size.__len__(), anchor_rotation.__len__()
+@@ -55,7 +55,7 @@ class AnchorGenerator(object):
+ 
+             anchors = anchors.permute(2, 1, 0, 3, 4, 5).contiguous()
+             #anchors = anchors.view(-1, anchors.shape[-1])
+-            anchors[..., 2] += anchors[..., 5] / 2  # shift to box centers
++            #anchors[..., 2] += anchors[..., 5] / 2  # shift to box centers
+             all_anchors.append(anchors)
+         return all_anchors, num_anchors_per_location
+ 
+diff --git a/pcdet/models/dense_heads/target_assigner/axis_aligned_target_assigner.py b/pcdet/models/dense_heads/target_assigner/axis_aligned_target_assigner.py
+index dfa9cea..7caa3c2 100644
+--- a/pcdet/models/dense_heads/target_assigner/axis_aligned_target_assigner.py
++++ b/pcdet/models/dense_heads/target_assigner/axis_aligned_target_assigner.py
+@@ -1,7 +1,7 @@
+ import numpy as np
+ import torch
+ 
+-from ....ops.iou3d_nms import iou3d_nms_utils
++#from ....ops.iou3d_nms import iou3d_nms_utils
+ from ....utils import box_utils
+ 
+ 
+@@ -141,12 +141,12 @@ class AxisAlignedTargetAssigner(object):
+             anchor_by_gt_overlap = iou3d_nms_utils.boxes_iou3d_gpu(anchors[:, 0:7], gt_boxes[:, 0:7]) \
+                 if self.match_height else box_utils.boxes3d_nearest_bev_iou(anchors[:, 0:7], gt_boxes[:, 0:7])
+ 
+-            anchor_to_gt_argmax = torch.from_numpy(anchor_by_gt_overlap.cpu().numpy().argmax(axis=1)).cuda()
++            anchor_to_gt_argmax = torch.from_numpy(anchor_by_gt_overlap.cpu().numpy().argmax(axis=1))
+             anchor_to_gt_max = anchor_by_gt_overlap[
+                 torch.arange(num_anchors, device=anchors.device), anchor_to_gt_argmax
+             ]
+ 
+-            gt_to_anchor_argmax = torch.from_numpy(anchor_by_gt_overlap.cpu().numpy().argmax(axis=0)).cuda()
++            gt_to_anchor_argmax = torch.from_numpy(anchor_by_gt_overlap.cpu().numpy().argmax(axis=0))
+             gt_to_anchor_max = anchor_by_gt_overlap[gt_to_anchor_argmax, torch.arange(num_gt, device=anchors.device)]
+             empty_gt_mask = gt_to_anchor_max == 0
+             gt_to_anchor_max[empty_gt_mask] = -1
+diff --git a/pcdet/models/detectors/detector3d_template.py b/pcdet/models/detectors/detector3d_template.py
+index 79dc1b8..a25b101 100644
+--- a/pcdet/models/detectors/detector3d_template.py
++++ b/pcdet/models/detectors/detector3d_template.py
+@@ -3,11 +3,11 @@ import os
+ import torch
+ import torch.nn as nn
+ 
+-from ...ops.iou3d_nms import iou3d_nms_utils
+-from .. import backbones_2d, backbones_3d, dense_heads, roi_heads
++from .. import backbones_2d, backbones_3d, dense_heads
+ from ..backbones_2d import map_to_bev
+-from ..backbones_3d import pfe, vfe
++from ..backbones_3d import vfe
+ from ..model_utils import model_nms_utils
++from openvino.inference_engine import IECore
+ 
+ 
+ class Detector3DTemplate(nn.Module):
+@@ -23,6 +23,11 @@ class Detector3DTemplate(nn.Module):
+             'vfe', 'backbone_3d', 'map_to_bev_module', 'pfe',
+             'backbone_2d', 'dense_head',  'point_head', 'roi_head'
+         ]
++        ie = IECore()
++        self.ie = ie
++
++    def get_ie(self):
++        return self.ie
+ 
+     @property
+     def mode(self):
+@@ -55,7 +60,8 @@ class Detector3DTemplate(nn.Module):
+             model_cfg=self.model_cfg.VFE,
+             num_point_features=model_info_dict['num_rawpoint_features'],
+             point_cloud_range=model_info_dict['point_cloud_range'],
+-            voxel_size=model_info_dict['voxel_size']
++            voxel_size=model_info_dict['voxel_size'],
++            openvino_ie=self.ie
+         )
+         model_info_dict['num_point_features'] = vfe_module.get_output_feature_dim()
+         model_info_dict['module_list'].append(vfe_module)
+@@ -94,7 +100,8 @@ class Detector3DTemplate(nn.Module):
+ 
+         backbone_2d_module = backbones_2d.__all__[self.model_cfg.BACKBONE_2D.NAME](
+             model_cfg=self.model_cfg.BACKBONE_2D,
+-            input_channels=model_info_dict['num_bev_features']
++            input_channels=model_info_dict['num_bev_features'],
++            openvino_ie=self.ie
+         )
+         model_info_dict['module_list'].append(backbone_2d_module)
+         model_info_dict['num_bev_features'] = backbone_2d_module.num_bev_features
+@@ -165,7 +172,7 @@ class Detector3DTemplate(nn.Module):
+     def forward(self, **kwargs):
+         raise NotImplementedError
+ 
+-    def post_processing(self, batch_dict):
++    def post_processing_openPCDet(self, batch_dict):
+         """
+         Args:
+             batch_dict:
+@@ -273,6 +280,52 @@ class Detector3DTemplate(nn.Module):
+ 
+         return pred_dicts, recall_dict
+ 
++    def post_processing(self, batch_dict):
++        post_process_cfg = self.model_cfg.POST_PROCESSING
++        frameid = batch_dict['frameid']
++        pred_dicts = []
++        #start_time = time.perf_counter()
++        a_mask = batch_dict['anchor_mask']
++        batch_cls_preds = batch_dict['batch_cls_preds'].squeeze(0)
++        batch_box_preds = batch_dict['batch_box_preds'].squeeze(0)
++        
++        box_preds = batch_box_preds[a_mask]
++        cls_preds = batch_cls_preds[a_mask]
++
++        total_scores = torch.sigmoid(cls_preds)
++        nms_score_threshold = post_process_cfg.SCORE_THRESH #0.05
++        top_scores = total_scores.squeeze(-1)
++        thresh = torch.tensor(
++            [nms_score_threshold],
++            device='cpu').type_as(total_scores)
++
++        top_scores_keep = (top_scores >= thresh)
++        #top_scores = top_scores.masked_select(top_scores_keep)
++
++        box_preds = box_preds[top_scores_keep]
++        cls_preds = top_scores[top_scores_keep]
++
++        #cls_preds, label_preds = torch.max(cls_preds, dim=-1)
++        label_preds = torch.ones((len(cls_preds),), dtype=torch.int64) #hard coding, as there is only one type
++
++        selected, selected_scores = model_nms_utils.class_agnostic_nms(
++            box_scores=cls_preds, box_preds=box_preds,
++            nms_config=post_process_cfg.NMS_CONFIG)
++
++        final_scores = selected_scores
++        final_labels = label_preds[selected]
++        final_boxes = box_preds[selected]
++        record_dict = {
++            'pred_boxes': final_boxes,
++            'pred_scores': final_scores,
++            'pred_labels': final_labels,
++            'pred_frameid': frameid
++        }
++        pred_dicts.append(record_dict)
++        #print('post processing: %.2fms, detect %.f objects' %((time.perf_counter() - start_time)*1000, len(final_labels)))
++
++        return pred_dicts
++
+     @staticmethod
+     def generate_recall_record(box_preds, recall_dict, batch_index, data_dict=None, thresh_list=None):
+         if 'gt_boxes' not in data_dict:
+diff --git a/pcdet/models/detectors/pointpillar.py b/pcdet/models/detectors/pointpillar.py
+index e21f826..fe569e1 100644
+--- a/pcdet/models/detectors/pointpillar.py
++++ b/pcdet/models/detectors/pointpillar.py
+@@ -1,25 +1,102 @@
+ from .detector3d_template import Detector3DTemplate
+-
++import time
+ 
+ class PointPillar(Detector3DTemplate):
+     def __init__(self, model_cfg, num_class, dataset):
+         super().__init__(model_cfg=model_cfg, num_class=num_class, dataset=dataset)
+         self.module_list = self.build_networks()
++        self.end_time = []
++        self.pfe = self.module_list[0] #PillarVFE
++        self.scatter = self.module_list[1] #PointPillarScatter
++        self.rpn = self.module_list[2] #BaseBEVBackbone
++        self.bbox = self.module_list[3] #AnchorHeadSingle
++
++    def balance(self, batch_dict):
++        if batch_dict is None:              ## None means this is the last inference
++            batch_dict_pre = self.rpn.postprocessing()
++            batch_dict_pre = self.bbox(batch_dict_pre)
++            pred_dicts = self.post_processing(batch_dict_pre)
++            self.end_time.append(time.perf_counter())
++            return pred_dicts
++        if (batch_dict['frameid'] == 0):
++            self.end_time = []
++            batch_dict = self.pfe.sync_call(batch_dict)
++            batch_dict = self.scatter(batch_dict)
++            inputs = self.rpn.preprocessing(batch_dict)
++            self.rpn.async_call(batch_dict, inputs)
++            return None
++        inputs = self.pfe.preprocessing(batch_dict)
++        self.pfe.async_call(batch_dict, inputs)
++        batch_dict_pre = self.rpn.postprocessing()
++        batch_dict_pre = self.bbox(batch_dict_pre)
++        pred_dicts = self.post_processing(batch_dict_pre)
++        self.end_time.append(time.perf_counter())
++        batch_dict = self.pfe.postprocessing()
++        batch_dict = self.scatter(batch_dict)
++        inputs = self.rpn.preprocessing(batch_dict)
++        self.rpn.async_call(batch_dict, inputs)
++        return pred_dicts
++
++    def throughput(self, batch_dict):
++        if batch_dict is None:              ## None means this is the last inference
++            pred_dicts = []
++            batch_dict_pre = self.rpn.postprocessing()
++            batch_dict_pre = self.bbox(batch_dict_pre)
++            pred_dicts.append(self.post_processing(batch_dict_pre))
++            self.end_time.append(time.perf_counter())
++
++            batch_dict_pre = self.pfe.postprocessing()
++            batch_dict_pre = self.scatter(batch_dict_pre)
++            batch_dict_pre = self.rpn.sync_call(batch_dict_pre)
++            batch_dict_pre = self.bbox(batch_dict_pre)
++            pred_dicts.append(self.post_processing(batch_dict_pre))
++            self.end_time.append(time.perf_counter())
++            return pred_dicts
++
++        if (batch_dict['frameid'] == 0):
++            self.end_time = []
++            inputs = self.pfe.preprocessing(batch_dict)
++            self.pfe.async_call(batch_dict, inputs)
++            return None
++        if (batch_dict['frameid'] == 1):
++            inputs = self.pfe.preprocessing(batch_dict)
++            batch_dict_pre = self.pfe.postprocessing()
++            self.pfe.async_call(batch_dict, inputs)
++
++            batch_dict_pre = self.scatter(batch_dict_pre)
++            inputs = self.rpn.preprocessing(batch_dict_pre)
++            self.rpn.async_call(batch_dict_pre, inputs)
++
++            return None
++
++        inputs = self.pfe.preprocessing(batch_dict)
++        batch_dict_pre = self.pfe.postprocessing()
++        self.pfe.async_call(batch_dict, inputs)
++
++        batch_dict_pre = self.scatter(batch_dict_pre)
++        inputs = self.rpn.preprocessing(batch_dict_pre)
++        batch_dict_pre2 = self.rpn.postprocessing()
++        self.rpn.async_call(batch_dict_pre, inputs)
++
++        batch_dict_pre2 = self.bbox(batch_dict_pre2)
++        pred_dicts = self.post_processing(batch_dict_pre2)
++        self.end_time.append(time.perf_counter())
+ 
+-    def forward(self, batch_dict):
+-        for cur_module in self.module_list:
+-            batch_dict = cur_module(batch_dict)
++        return pred_dicts
+ 
+-        if self.training:
+-            loss, tb_dict, disp_dict = self.get_training_loss()
++    def latency(self, batch_dict):
++        if batch_dict is None:              ## None means this is the last inference
++            return None
++        if (batch_dict['frameid'] == 0):
++            self.end_time = []
++        batch_dict = self.pfe.sync_call(batch_dict)
++        batch_dict = self.scatter(batch_dict)
++        batch_dict = self.rpn.sync_call(batch_dict)
++        batch_dict = self.bbox(batch_dict)
++        pred_dicts = self.post_processing(batch_dict)
++        self.end_time.append(time.perf_counter())
++        return pred_dicts
+ 
+-            ret_dict = {
+-                'loss': loss
+-            }
+-            return ret_dict, tb_dict, disp_dict
+-        else:
+-            pred_dicts, recall_dicts = self.post_processing(batch_dict)
+-            return pred_dicts, recall_dicts
+ 
+     def get_training_loss(self):
+         disp_dict = {}
+diff --git a/pcdet/ops/iou3d_nms/iou3d_nms_utils.py b/pcdet/ops/iou3d_nms/iou3d_nms_utils.py
+index 66f0084..57e5ee3 100644
+--- a/pcdet/ops/iou3d_nms/iou3d_nms_utils.py
++++ b/pcdet/ops/iou3d_nms/iou3d_nms_utils.py
+@@ -96,7 +96,7 @@ def nms_gpu(boxes, scores, thresh, pre_maxsize=None, **kwargs):
+     boxes = boxes[order].contiguous()
+     keep = torch.LongTensor(boxes.size(0))
+     num_out = iou3d_nms_cuda.nms_gpu(boxes, keep, thresh)
+-    return order[keep[:num_out].cuda()].contiguous(), None
++    return order[keep[:num_out]].contiguous(), None
+ 
+ 
+ def nms_normal_gpu(boxes, scores, thresh, **kwargs):
+@@ -113,4 +113,4 @@ def nms_normal_gpu(boxes, scores, thresh, **kwargs):
+ 
+     keep = torch.LongTensor(boxes.size(0))
+     num_out = iou3d_nms_cuda.nms_normal_gpu(boxes, keep, thresh)
+-    return order[keep[:num_out].cuda()].contiguous(), None
++    return order[keep[:num_out]].contiguous(), None
+diff --git a/pcdet/ops/iou3d_nms/src/iou3d_cpu.cpp b/pcdet/ops/iou3d_nms/src/iou3d_cpu.cpp
+index d528ad9..6d23624 100644
+--- a/pcdet/ops/iou3d_nms/src/iou3d_cpu.cpp
++++ b/pcdet/ops/iou3d_nms/src/iou3d_cpu.cpp
+@@ -9,8 +9,6 @@ All Rights Reserved 2020.
+ #include <torch/serialize/tensor.h>
+ #include <torch/extension.h>
+ #include <vector>
+-#include <cuda.h>
+-#include <cuda_runtime_api.h>
+ #include "iou3d_cpu.h"
+ 
+ #define CHECK_CUDA(x) do { \
+@@ -38,20 +36,20 @@ inline float max(float a, float b){
+ const float EPS = 1e-8;
+ struct Point {
+     float x, y;
+-    __device__ Point() {}
+-    __device__ Point(double _x, double _y){
++     Point() {}
++     Point(double _x, double _y){
+         x = _x, y = _y;
+     }
+ 
+-    __device__ void set(float _x, float _y){
++     void set(float _x, float _y){
+         x = _x; y = _y;
+     }
+ 
+-    __device__ Point operator +(const Point &b)const{
++     Point operator +(const Point &b)const{
+         return Point(x + b.x, y + b.y);
+     }
+ 
+-    __device__ Point operator -(const Point &b)const{
++     Point operator -(const Point &b)const{
+         return Point(x - b.x, y - b.y);
+     }
+ };
+@@ -250,3 +248,40 @@ int boxes_iou_bev_cpu(at::Tensor boxes_a_tensor, at::Tensor boxes_b_tensor, at::
+     }
+     return 1;
+ }
++
++void nmsLauncher(const float *boxes, bool *mask,
++                const int boxes_num, const float nms_overlap_thresh){
++    //params: boxes (N, 7) [x, y, z, dx, dy, dz, heading]
++    //params: mask (N, N/THREADS_PER_BLOCK_NMS)
++    //printf("====================nmsLauncher===================\n");
++    int col_idx = 0;
++    int row_idx = 0;
++
++    float block_boxes[7];
++
++    mask[0] = false;
++    for (col_idx = 0; col_idx < boxes_num; col_idx++){
++        if (mask[col_idx]==true)
++            continue;
++        block_boxes[0] = boxes[col_idx * 7 + 0];
++        block_boxes[1] = boxes[col_idx * 7 + 1];
++        block_boxes[2] = boxes[col_idx * 7 + 2];
++        block_boxes[3] = boxes[col_idx * 7 + 3];
++        block_boxes[4] = boxes[col_idx * 7 + 4];
++        block_boxes[5] = boxes[col_idx * 7 + 5];
++        block_boxes[6] = boxes[col_idx * 7 + 6];
++
++        //printf("\n\nblock[%d]\n", col_idx);
++        for (row_idx = col_idx + 1; row_idx < boxes_num; row_idx++){
++            const float *cur_box = boxes + row_idx * 7;
++            bool drop = 0;
++
++            if (iou_bev(cur_box, block_boxes) > nms_overlap_thresh){
++                drop = true;
++                mask[row_idx] = drop;
++                //printf("\tdrop cur_box[%d]\n", row_idx);
++            }
++        }
++    }
++}
++
+diff --git a/pcdet/ops/iou3d_nms/src/iou3d_cpu.h b/pcdet/ops/iou3d_nms/src/iou3d_cpu.h
+index 8835ee7..5c21e05 100644
+--- a/pcdet/ops/iou3d_nms/src/iou3d_cpu.h
++++ b/pcdet/ops/iou3d_nms/src/iou3d_cpu.h
+@@ -3,8 +3,6 @@
+ 
+ #include <torch/serialize/tensor.h>
+ #include <vector>
+-#include <cuda.h>
+-#include <cuda_runtime_api.h>
+ 
+ int boxes_iou_bev_cpu(at::Tensor boxes_a_tensor, at::Tensor boxes_b_tensor, at::Tensor ans_iou_tensor);
+ 
+diff --git a/pcdet/ops/iou3d_nms/src/iou3d_nms.cpp b/pcdet/ops/iou3d_nms/src/iou3d_nms.cpp
+index d41da8a..01156e5 100644
+--- a/pcdet/ops/iou3d_nms/src/iou3d_nms.cpp
++++ b/pcdet/ops/iou3d_nms/src/iou3d_nms.cpp
+@@ -7,25 +7,22 @@ All Rights Reserved 2019-2020.
+ #include <torch/serialize/tensor.h>
+ #include <torch/extension.h>
+ #include <vector>
+-#include <cuda.h>
+-#include <cuda_runtime_api.h>
+ #include "iou3d_nms.h"
+ 
+ #define CHECK_CUDA(x) do { \
+   if (!x.type().is_cuda()) { \
+     fprintf(stderr, "%s must be CUDA tensor at %s:%d\n", #x, __FILE__, __LINE__); \
+-    exit(-1); \
+   } \
+ } while (0)
+ #define CHECK_CONTIGUOUS(x) do { \
+   if (!x.is_contiguous()) { \
+     fprintf(stderr, "%s must be contiguous tensor at %s:%d\n", #x, __FILE__, __LINE__); \
+-    exit(-1); \
+   } \
+ } while (0)
+ #define CHECK_INPUT(x) CHECK_CUDA(x);CHECK_CONTIGUOUS(x)
+ 
+ #define DIVUP(m,n) ((m) / (n) + ((m) % (n) > 0))
++#if 0
+ 
+ #define CHECK_ERROR(ans) { gpuAssert((ans), __FILE__, __LINE__); }
+ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true)
+@@ -36,13 +33,14 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
+       if (abort) exit(code);
+    }
+ }
++#endif
+ 
+ const int THREADS_PER_BLOCK_NMS = sizeof(unsigned long long) * 8;
+ 
+ 
+ void boxesoverlapLauncher(const int num_a, const float *boxes_a, const int num_b, const float *boxes_b, float *ans_overlap);
+ void boxesioubevLauncher(const int num_a, const float *boxes_a, const int num_b, const float *boxes_b, float *ans_iou);
+-void nmsLauncher(const float *boxes, unsigned long long * mask, int boxes_num, float nms_overlap_thresh);
++void nmsLauncher(const float *boxes, bool *mask, int boxes_num, float nms_overlap_thresh);
+ void nmsNormalLauncher(const float *boxes, unsigned long long * mask, int boxes_num, float nms_overlap_thresh);
+ 
+ 
+@@ -62,7 +60,7 @@ int boxes_overlap_bev_gpu(at::Tensor boxes_a, at::Tensor boxes_b, at::Tensor ans
+     const float * boxes_b_data = boxes_b.data<float>();
+     float * ans_overlap_data = ans_overlap.data<float>();
+ 
+-    boxesoverlapLauncher(num_a, boxes_a_data, num_b, boxes_b_data, ans_overlap_data);
++    //boxesoverlapLauncher(num_a, boxes_a_data, num_b, boxes_b_data, ans_overlap_data);
+ 
+     return 1;
+ }
+@@ -82,7 +80,7 @@ int boxes_iou_bev_gpu(at::Tensor boxes_a, at::Tensor boxes_b, at::Tensor ans_iou
+     const float * boxes_b_data = boxes_b.data<float>();
+     float * ans_iou_data = ans_iou.data<float>();
+ 
+-    boxesioubevLauncher(num_a, boxes_a_data, num_b, boxes_b_data, ans_iou_data);
++    //boxesioubevLauncher(num_a, boxes_a_data, num_b, boxes_b_data, ans_iou_data);
+ 
+     return 1;
+ }
+@@ -90,47 +88,27 @@ int boxes_iou_bev_gpu(at::Tensor boxes_a, at::Tensor boxes_b, at::Tensor ans_iou
+ int nms_gpu(at::Tensor boxes, at::Tensor keep, float nms_overlap_thresh){
+     // params boxes: (N, 7) [x, y, z, dx, dy, dz, heading]
+     // params keep: (N)
+-    CHECK_INPUT(boxes);
++    //CHECK_INPUT(boxes);
+     CHECK_CONTIGUOUS(keep);
+ 
+     int boxes_num = boxes.size(0);
+     const float * boxes_data = boxes.data<float>();
+     long * keep_data = keep.data<long>();
+ 
+-    const int col_blocks = DIVUP(boxes_num, THREADS_PER_BLOCK_NMS);
+-
+-    unsigned long long *mask_data = NULL;
+-    CHECK_ERROR(cudaMalloc((void**)&mask_data, boxes_num * col_blocks * sizeof(unsigned long long)));
++    bool *mask_data = NULL;
++    mask_data = (bool *)malloc(boxes_num * sizeof(bool));
++    memset(mask_data, 0, boxes_num*sizeof(bool));
++    
+     nmsLauncher(boxes_data, mask_data, boxes_num, nms_overlap_thresh);
+ 
+-    // unsigned long long mask_cpu[boxes_num * col_blocks];
+-    // unsigned long long *mask_cpu = new unsigned long long [boxes_num * col_blocks];
+-    std::vector<unsigned long long> mask_cpu(boxes_num * col_blocks);
+-
+-//    printf("boxes_num=%d, col_blocks=%d\n", boxes_num, col_blocks);
+-    CHECK_ERROR(cudaMemcpy(&mask_cpu[0], mask_data, boxes_num * col_blocks * sizeof(unsigned long long),
+-                           cudaMemcpyDeviceToHost));
+-
+-    cudaFree(mask_data);
+-
+-    unsigned long long remv_cpu[col_blocks];
+-    memset(remv_cpu, 0, col_blocks * sizeof(unsigned long long));
+-
+     int num_to_keep = 0;
+-
+     for (int i = 0; i < boxes_num; i++){
+-        int nblock = i / THREADS_PER_BLOCK_NMS;
+-        int inblock = i % THREADS_PER_BLOCK_NMS;
+-
+-        if (!(remv_cpu[nblock] & (1ULL << inblock))){
++        //printf("mask_data[%d] = %d \n", i, mask_data[i]);
++        if (false == mask_data[i]) {
+             keep_data[num_to_keep++] = i;
+-            unsigned long long *p = &mask_cpu[0] + i * col_blocks;
+-            for (int j = nblock; j < col_blocks; j++){
+-                remv_cpu[j] |= p[j];
+-            }
++            //printf("\tkeep box %d \n", i);
+         }
+     }
+-    if ( cudaSuccess != cudaGetLastError() ) printf( "Error!\n" );
+ 
+     return num_to_keep;
+ }
+@@ -150,18 +128,20 @@ int nms_normal_gpu(at::Tensor boxes, at::Tensor keep, float nms_overlap_thresh){
+     const int col_blocks = DIVUP(boxes_num, THREADS_PER_BLOCK_NMS);
+ 
+     unsigned long long *mask_data = NULL;
+-    CHECK_ERROR(cudaMalloc((void**)&mask_data, boxes_num * col_blocks * sizeof(unsigned long long)));
+-    nmsNormalLauncher(boxes_data, mask_data, boxes_num, nms_overlap_thresh);
++    mask_data = (unsigned long long*)malloc(boxes_num * col_blocks * sizeof(unsigned long long));
++    //nmsNormalLauncher(boxes_data, mask_data, boxes_num, nms_overlap_thresh);
+ 
+     // unsigned long long mask_cpu[boxes_num * col_blocks];
+     // unsigned long long *mask_cpu = new unsigned long long [boxes_num * col_blocks];
+     std::vector<unsigned long long> mask_cpu(boxes_num * col_blocks);
+ 
+ //    printf("boxes_num=%d, col_blocks=%d\n", boxes_num, col_blocks);
+-    CHECK_ERROR(cudaMemcpy(&mask_cpu[0], mask_data, boxes_num * col_blocks * sizeof(unsigned long long),
+-                           cudaMemcpyDeviceToHost));
++    //CHECK_ERROR(cudaMemcpy(&mask_cpu[0], mask_data, boxes_num * col_blocks * sizeof(unsigned long long),
++    //                       cudaMemcpyDeviceToHost));
+ 
+-    cudaFree(mask_data);
++    //cudaFree(mask_data);
++    memcpy(&mask_cpu[0], mask_data, boxes_num * col_blocks * sizeof(unsigned long long));
++    free(mask_data);
+ 
+     unsigned long long remv_cpu[col_blocks];
+     memset(remv_cpu, 0, col_blocks * sizeof(unsigned long long));
+@@ -180,7 +160,7 @@ int nms_normal_gpu(at::Tensor boxes, at::Tensor keep, float nms_overlap_thresh){
+             }
+         }
+     }
+-    if ( cudaSuccess != cudaGetLastError() ) printf( "Error!\n" );
++    //if ( cudaSuccess != cudaGetLastError() ) printf( "Error!\n" );
+ 
+     return num_to_keep;
+ }
+diff --git a/pcdet/ops/iou3d_nms/src/iou3d_nms.h b/pcdet/ops/iou3d_nms/src/iou3d_nms.h
+index aa7ae0e..36fc3bd 100644
+--- a/pcdet/ops/iou3d_nms/src/iou3d_nms.h
++++ b/pcdet/ops/iou3d_nms/src/iou3d_nms.h
+@@ -3,8 +3,6 @@
+ 
+ #include <torch/serialize/tensor.h>
+ #include <vector>
+-#include <cuda.h>
+-#include <cuda_runtime_api.h>
+ 
+ int boxes_overlap_bev_gpu(at::Tensor boxes_a, at::Tensor boxes_b, at::Tensor ans_overlap);
+ int boxes_iou_bev_gpu(at::Tensor boxes_a, at::Tensor boxes_b, at::Tensor ans_iou);
+diff --git a/pcdet/ops/iou3d_nms/src/iou3d_nms_api.cpp b/pcdet/ops/iou3d_nms/src/iou3d_nms_api.cpp
+index 5a2d3a3..201571d 100644
+--- a/pcdet/ops/iou3d_nms/src/iou3d_nms_api.cpp
++++ b/pcdet/ops/iou3d_nms/src/iou3d_nms_api.cpp
+@@ -1,8 +1,6 @@
+ #include <torch/serialize/tensor.h>
+ #include <torch/extension.h>
+ #include <vector>
+-#include <cuda.h>
+-#include <cuda_runtime_api.h>
+ 
+ #include "iou3d_cpu.h"
+ #include "iou3d_nms.h"
+diff --git a/pcdet/utils/box_coder_utils.py b/pcdet/utils/box_coder_utils.py
+index 472d973..608387a 100644
+--- a/pcdet/utils/box_coder_utils.py
++++ b/pcdet/utils/box_coder_utils.py
+@@ -56,7 +56,8 @@ class ResidualCoder(object):
+             xt, yt, zt, dxt, dyt, dzt, rt, *cts = torch.split(box_encodings, 1, dim=-1)
+         else:
+             xt, yt, zt, dxt, dyt, dzt, cost, sint, *cts = torch.split(box_encodings, 1, dim=-1)
+-
++        
++        za = za + dza / 2
+         diagonal = torch.sqrt(dxa ** 2 + dya ** 2)
+         xg = xt * diagonal + xa
+         yg = yt * diagonal + ya
+@@ -73,6 +74,7 @@ class ResidualCoder(object):
+         else:
+             rg = rt + ra
+ 
++        zg = zg - dzg / 2
+         cgs = [t + a for t, a in zip(cts, cas)]
+         return torch.cat([xg, yg, zg, dxg, dyg, dzg, rg, *cgs], dim=-1)
+ 
+diff --git a/pcdet/utils/box_utils.py b/pcdet/utils/box_utils.py
+index 1e57239..1cd18c7 100644
+--- a/pcdet/utils/box_utils.py
++++ b/pcdet/utils/box_utils.py
+@@ -1,11 +1,22 @@
++import numba
+ import numpy as np
++import copy
+ import scipy
+ import torch
+ from scipy.spatial import Delaunay
+ 
+-from ..ops.roiaware_pool3d import roiaware_pool3d_utils
++#from ..ops.roiaware_pool3d import roiaware_pool3d_utils
+ from . import common_utils
+ 
++def center_to_minmax_2d_0_5(centers, dims):
++    return np.concatenate([centers - dims / 2, centers + dims / 2], axis=-1)
++
++
++def center_to_minmax_2d(centers, dims, origin=0.5):
++    if origin == 0.5:
++        return center_to_minmax_2d_0_5(centers, dims)
++    corners = center_to_corner_box2d(centers, dims, origin=origin)
++    return corners[:, [0, 2]].reshape([-1, 4])
+ 
+ def in_hull(p, hull):
+     """
+@@ -98,8 +109,10 @@ def boxes3d_kitti_camera_to_lidar(boxes3d_camera, calib):
+         boxes3d_lidar: [x, y, z, dx, dy, dz, heading], (x, y, z) is the box center
+ 
+     """
+-    xyz_camera = boxes3d_camera[:, 0:3]
+-    l, h, w, r = boxes3d_camera[:, 3:4], boxes3d_camera[:, 4:5], boxes3d_camera[:, 5:6], boxes3d_camera[:, 6:7]
++    boxes3d_camera_copy = copy.deepcopy(boxes3d_camera)
++    xyz_camera, r = boxes3d_camera_copy[:, 0:3], boxes3d_camera_copy[:, 6:7]
++    l, h, w = boxes3d_camera_copy[:, 3:4], boxes3d_camera_copy[:, 4:5], boxes3d_camera_copy[:, 5:6]
++
+     xyz_lidar = calib.rect_to_lidar(xyz_camera)
+     xyz_lidar[:, 2] += h[:, 0] / 2
+     return np.concatenate([xyz_lidar, l, w, h, -(r + np.pi / 2)], axis=-1)
+@@ -285,3 +298,55 @@ def boxes3d_nearest_bev_iou(boxes_a, boxes_b):
+     boxes_bev_b = boxes3d_lidar_to_aligned_bev_boxes(boxes_b)
+ 
+     return boxes_iou_normal(boxes_bev_a, boxes_bev_b)
++
++def rbbox2d_to_near_bbox(rbboxes):
++    """convert rotated bbox to nearest 'standing' or 'lying' bbox.
++    Args:
++        rbboxes: [N, 5(x, y, xdim, ydim, rad)] rotated bboxes
++    Returns:
++        bboxes: [N, 4(xmin, ymin, xmax, ymax)] bboxes
++    """
++    rots = rbboxes[..., -1]
++    rots_0_pi_div_2 = np.abs(common_utils.limit_period(rots, 0.5, np.pi))
++    cond = (rots_0_pi_div_2 > np.pi / 4)[..., np.newaxis]
++    bboxes_center = np.where(cond, rbboxes[:, [0, 1, 3, 2]], rbboxes[:, :4])
++    bboxes = center_to_minmax_2d(bboxes_center[:, :2], bboxes_center[:, 2:])
++    return bboxes
++
++@numba.jit(nopython=True)
++def sparse_sum_for_anchors_mask(coors, shape):
++    ret = np.zeros(shape, dtype=np.float32)
++    for i in range(coors.shape[0]):
++        ret[coors[i, 1], coors[i, 2]] += 1
++    return ret
++
++
++@numba.jit(nopython=True)
++def fused_get_anchors_area(dense_map, anchors_bv, stride, offset,
++                           grid_size):
++    anchor_coor = np.zeros(anchors_bv.shape[1:], dtype=np.int32)
++    grid_size_x = grid_size[0] - 1
++    grid_size_y = grid_size[1] - 1
++    N = anchors_bv.shape[0]
++    ret = np.zeros((N), dtype=dense_map.dtype)
++    sum = 0
++    for i in range(N):
++        anchor_coor[0] = np.floor(
++            (anchors_bv[i, 0] - offset[0]) / stride[0])
++        anchor_coor[1] = np.floor(
++            (anchors_bv[i, 1] - offset[1]) / stride[1])
++        anchor_coor[2] = np.floor(
++            (anchors_bv[i, 2] - offset[0]) / stride[0])
++        anchor_coor[3] = np.floor(
++            (anchors_bv[i, 3] - offset[1]) / stride[1])
++        anchor_coor[0] = max(anchor_coor[0], 0)
++        anchor_coor[1] = max(anchor_coor[1], 0)
++        anchor_coor[2] = min(anchor_coor[2], grid_size_x)
++        anchor_coor[3] = min(anchor_coor[3], grid_size_y)
++        ID = dense_map[anchor_coor[3], anchor_coor[2]]
++        IA = dense_map[anchor_coor[1], anchor_coor[0]]
++        IB = dense_map[anchor_coor[3], anchor_coor[0]]
++        IC = dense_map[anchor_coor[1], anchor_coor[2]]
++        ret[i] = ID - IB - IC + IA
++    return ret
++    
+diff --git a/pcdet/utils/calibration_kitti.py b/pcdet/utils/calibration_kitti.py
+index d7ff1f5..3777580 100644
+--- a/pcdet/utils/calibration_kitti.py
++++ b/pcdet/utils/calibration_kitti.py
+@@ -39,6 +39,15 @@ class Calibration(object):
+         self.tx = self.P2[0, 3] / (-self.fu)
+         self.ty = self.P2[1, 3] / (-self.fv)
+ 
++    def get_V2C(self):
++        return self.V2C
++
++    def get_R0(self):
++        return self.R0
++
++    def get_P2(self):
++        return self.P2
++
+     def cart_to_hom(self, pts):
+         """
+         :param pts: (N, 3 or 2)
+diff --git a/pcdet/utils/loss_utils.py b/pcdet/utils/loss_utils.py
+index 323bfcf..24fa9f0 100644
+--- a/pcdet/utils/loss_utils.py
++++ b/pcdet/utils/loss_utils.py
+@@ -94,7 +94,7 @@ class WeightedSmoothL1Loss(nn.Module):
+         self.beta = beta
+         if code_weights is not None:
+             self.code_weights = np.array(code_weights, dtype=np.float32)
+-            self.code_weights = torch.from_numpy(self.code_weights).cuda()
++            self.code_weights = torch.from_numpy(self.code_weights)
+ 
+     @staticmethod
+     def smooth_l1_loss(diff, beta):
+@@ -146,7 +146,7 @@ class WeightedL1Loss(nn.Module):
+         super(WeightedL1Loss, self).__init__()
+         if code_weights is not None:
+             self.code_weights = np.array(code_weights, dtype=np.float32)
+-            self.code_weights = torch.from_numpy(self.code_weights).cuda()
++            self.code_weights = torch.from_numpy(self.code_weights)
+ 
+     def forward(self, input: torch.Tensor, target: torch.Tensor, weights: torch.Tensor = None):
+         """
+diff --git a/requirements.txt b/requirements.txt
+index aa85ef8..e1b4b74 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,6 +1,6 @@
+-numpy
++numpy==1.20.3
+ torch>=1.1
+-numba
++numba>=0.53.1
+ tensorboardX
+ easydict
+ pyyaml
+diff --git a/setup.py b/setup.py
+index ab7afe3..8e40303 100644
+--- a/setup.py
++++ b/setup.py
+@@ -2,7 +2,7 @@ import os
+ import subprocess
+ 
+ from setuptools import find_packages, setup
+-from torch.utils.cpp_extension import BuildExtension, CUDAExtension
++from torch.utils.cpp_extension import BuildExtension, CppExtension
+ 
+ 
+ def get_git_commit_number():
+@@ -15,7 +15,7 @@ def get_git_commit_number():
+ 
+ 
+ def make_cuda_ext(name, module, sources):
+-    cuda_ext = CUDAExtension(
++    cuda_ext = CppExtension(
+         name='%s.%s' % (module, name),
+         sources=[os.path.join(*module.split('.'), src) for src in sources]
+     )
+@@ -38,7 +38,6 @@ if __name__ == '__main__':
+         install_requires=[
+             'numpy',
+             'torch>=1.1',
+-            'spconv',
+             'numba',
+             'tensorboardX',
+             'easydict',
+@@ -57,55 +56,7 @@ if __name__ == '__main__':
+                     'src/iou3d_cpu.cpp',
+                     'src/iou3d_nms_api.cpp',
+                     'src/iou3d_nms.cpp',
+-                    'src/iou3d_nms_kernel.cu',
+                 ]
+             ),
+-            make_cuda_ext(
+-                name='roiaware_pool3d_cuda',
+-                module='pcdet.ops.roiaware_pool3d',
+-                sources=[
+-                    'src/roiaware_pool3d.cpp',
+-                    'src/roiaware_pool3d_kernel.cu',
+-                ]
+-            ),
+-            make_cuda_ext(
+-                name='roipoint_pool3d_cuda',
+-                module='pcdet.ops.roipoint_pool3d',
+-                sources=[
+-                    'src/roipoint_pool3d.cpp',
+-                    'src/roipoint_pool3d_kernel.cu',
+-                ]
+-            ),
+-            make_cuda_ext(
+-                name='pointnet2_stack_cuda',
+-                module='pcdet.ops.pointnet2.pointnet2_stack',
+-                sources=[
+-                    'src/pointnet2_api.cpp',
+-                    'src/ball_query.cpp',
+-                    'src/ball_query_gpu.cu',
+-                    'src/group_points.cpp',
+-                    'src/group_points_gpu.cu',
+-                    'src/sampling.cpp',
+-                    'src/sampling_gpu.cu', 
+-                    'src/interpolate.cpp', 
+-                    'src/interpolate_gpu.cu',
+-                ],
+-            ),
+-            make_cuda_ext(
+-                name='pointnet2_batch_cuda',
+-                module='pcdet.ops.pointnet2.pointnet2_batch',
+-                sources=[
+-                    'src/pointnet2_api.cpp',
+-                    'src/ball_query.cpp',
+-                    'src/ball_query_gpu.cu',
+-                    'src/group_points.cpp',
+-                    'src/group_points_gpu.cu',
+-                    'src/interpolate.cpp',
+-                    'src/interpolate_gpu.cu',
+-                    'src/sampling.cpp',
+-                    'src/sampling_gpu.cu',
+-
+-                ],
+-            ),
+         ],
+     )
+diff --git a/tools/cfgs/dataset_configs/kitti_dataset.yaml b/tools/cfgs/dataset_configs/kitti_dataset.yaml
+index 5e54723..c5ca452 100644
+--- a/tools/cfgs/dataset_configs/kitti_dataset.yaml
++++ b/tools/cfgs/dataset_configs/kitti_dataset.yaml
+@@ -1,5 +1,5 @@
+ DATASET: 'KittiDataset'
+-DATA_PATH: '../data/kitti'
++DATA_PATH: '/home/iotg/work/kitti_dataset'
+ 
+ POINT_CLOUD_RANGE: [0, -40, -3, 70.4, 40, 1]
+ 
+@@ -10,7 +10,8 @@ DATA_SPLIT: {
+ 
+ INFO_PATH: {
+     'train': [kitti_infos_train.pkl],
+-    'test': [kitti_infos_val.pkl],
++    'test': [kitti_infos_train.pkl],
++    #'test': [kitti_infos_val.pkl],
+ }
+ 
+ FOV_POINTS_ONLY: True
+diff --git a/tools/demo.py b/tools/demo.py
+index 0bda7ae..21c1280 100644
+--- a/tools/demo.py
++++ b/tools/demo.py
+@@ -2,19 +2,17 @@ import argparse
+ import glob
+ from pathlib import Path
+ 
+-import mayavi.mlab as mlab
+ import numpy as np
+ import torch
+-
++import time
+ from pcdet.config import cfg, cfg_from_yaml_file
+ from pcdet.datasets import DatasetTemplate
+ from pcdet.models import build_network, load_data_to_gpu
+ from pcdet.utils import common_utils
+-from visual_utils import visualize_utils as V
+ 
+ 
+ class DemoDataset(DatasetTemplate):
+-    def __init__(self, dataset_cfg, class_names, training=True, root_path=None, logger=None, ext='.bin'):
++    def __init__(self, dataset_cfg, class_names, training=True, root_path=None, logger=None, ext='.bin', ram=False):
+         """
+         Args:
+             root_path:
+@@ -29,15 +27,28 @@ class DemoDataset(DatasetTemplate):
+         self.root_path = root_path
+         self.ext = ext
+         data_file_list = glob.glob(str(root_path / f'*{self.ext}')) if self.root_path.is_dir() else [self.root_path]
++        assert data_file_list, 'Make sure there are point data (.bin or .npy) in the folder.'
+ 
+         data_file_list.sort()
+         self.sample_file_list = data_file_list
+ 
++        self.points_set = []
++        if ram:
++            for idx in range(len(self.sample_file_list)):
++                if self.ext == '.bin':
++                    points = np.fromfile(self.sample_file_list[idx], dtype=np.float32).reshape(-1, 4)
++                elif self.ext == '.npy':
++                    points = np.load(self.sample_file_list[idx])
++                else:
++                    raise NotImplementedError
++                self.points_set.append(points)
+     def __len__(self):
+         return len(self.sample_file_list)
+ 
+     def __getitem__(self, index):
+-        if self.ext == '.bin':
++        if self.points_set:
++            points = self.points_set[index]
++        elif self.ext == '.bin':
+             points = np.fromfile(self.sample_file_list[index], dtype=np.float32).reshape(-1, 4)
+         elif self.ext == '.npy':
+             points = np.load(self.sample_file_list[index])
+@@ -55,12 +66,15 @@ class DemoDataset(DatasetTemplate):
+ 
+ def parse_config():
+     parser = argparse.ArgumentParser(description='arg parser')
+-    parser.add_argument('--cfg_file', type=str, default='cfgs/kitti_models/second.yaml',
++    parser.add_argument('--cfg_file', type=str, default='pointpillar.yaml',
+                         help='specify the config for demo')
+-    parser.add_argument('--data_path', type=str, default='demo_data',
++    parser.add_argument('--data_path', type=str, default='/home/iotg/work/kitti_dataset/training/velodyne_reduced',
+                         help='specify the point cloud data file or directory')
+-    parser.add_argument('--ckpt', type=str, default=None, help='specify the pretrained model')
++    parser.add_argument('--mode', type=str, default='balance', help='specify the pineline excute mode: balance throughput latency or all')
+     parser.add_argument('--ext', type=str, default='.bin', help='specify the extension of your point cloud data file')
++    parser.add_argument('--num', type=int, default='-1', help='specify how many files are used. -1 mean all')
++    parser.add_argument('--debug', action='store_true', default=False, help='specify if enable debug result')
++    parser.add_argument('--ram', action='store_true', default=False, help='specify if read the dataset firstly')
+ 
+     args = parser.parse_args()
+ 
+@@ -68,33 +82,91 @@ def parse_config():
+ 
+     return args, cfg
+ 
++def run(model, mode, num, demo_dataset, logger, debug_print):
++    logger.info('------run number of samples: \t{} in mode: {}'.format(num, mode))
++    func_dict = {
++                'balance': model.balance,
++                'throughput': model.throughput,
++                'latency': model.latency,
++                };
++
++    exec_fun = func_dict[mode]
++
++    device = 'cpu'
++    model.to(device)
++
++    model.eval()
++    start_time_2 = time.perf_counter()
++    frames = 0
++    start_time = []
++    end_time = []
++    latency = []
++
++    with torch.no_grad():
++        start_time.append(time.perf_counter())
++        for idx, data_dict in enumerate(demo_dataset):
++            data_dict = demo_dataset.collate_batch([data_dict])
++            data_dict['frameid'] = idx
++            load_data_to_gpu(data_dict)
++            pred_dicts = exec_fun(data_dict)
++            logger.info (pred_dicts) if debug_print and pred_dicts else None
++            start_time.append(time.perf_counter())
++            frames = frames + 1
++            if frames >= num:
++                break
++        pred_dicts = exec_fun(None)
++        logger.info (pred_dicts) if debug_print and pred_dicts else None
++        start_time.pop()
++
++    total_time = time.perf_counter() - start_time_2
++    end_time = model.end_time
++    latency = np.array(end_time) - np.array(start_time)
++    if len(latency) > 20:
++        latency = latency[10:-10]  ##remove the first and last 10 elements
++    elif len(latency) > 4:
++        latency = latency[1:-1]  ##remove the first and last 1 elements
++
++    if total_time < 1:
++        logger.info('total: \t\t%.2f milliseconds' % (total_time*1000))
++    else:
++        logger.info('total: \t\t%.2f seconds' % (total_time))
++    logger.info('FPS: \t\t%.2f' % (frames/total_time))
++    logger.info('latency: \t%.2f milliseconds' % (np.mean(latency) * 1000))
+ 
+ def main():
+     args, cfg = parse_config()
+     logger = common_utils.create_logger()
++
++    modes = ['balance', 'throughput', 'latency']
++    run_mode = []
++    if args.mode == 'all':
++        run_mode = modes
++    elif args.mode in modes:
++        run_mode.append(args.mode)
++    else:
++        logger.error ("The mode is not support, please select in {}".format(list(modes)))
++        logger.error ("Or could set mode to 'all' to run all the modes above")
++        exit(1)
++
++    num = args.num
++    if num != -1 and num < 5 and args.mode != 'latency':
++        logger.error ("at least 5 frames are need for mode balance and throughput.")
++        exit(1)
++
+     logger.info('-----------------Quick Demo of OpenPCDet-------------------------')
++    logger.info('Loading the dataset and model.')
+     demo_dataset = DemoDataset(
+         dataset_cfg=cfg.DATA_CONFIG, class_names=cfg.CLASS_NAMES, training=False,
+-        root_path=Path(args.data_path), ext=args.ext, logger=logger
++        root_path=Path(args.data_path), ext=args.ext, logger=logger, ram=args.ram
+     )
+-    logger.info(f'Total number of samples: \t{len(demo_dataset)}')
+ 
+     model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=demo_dataset)
+-    model.load_params_from_file(filename=args.ckpt, logger=logger, to_cpu=True)
+-    model.cuda()
+-    model.eval()
+-    with torch.no_grad():
+-        for idx, data_dict in enumerate(demo_dataset):
+-            logger.info(f'Visualized sample index: \t{idx + 1}')
+-            data_dict = demo_dataset.collate_batch([data_dict])
+-            load_data_to_gpu(data_dict)
+-            pred_dicts, _ = model.forward(data_dict)
+ 
+-            V.draw_scenes(
+-                points=data_dict['points'][:, 1:], ref_boxes=pred_dicts[0]['pred_boxes'],
+-                ref_scores=pred_dicts[0]['pred_scores'], ref_labels=pred_dicts[0]['pred_labels']
+-            )
+-            mlab.show(stop=True)
++    num = len(demo_dataset) if num == -1 else num
++
++    logger.info('number of samples in dataset: \t{}'.format(len(demo_dataset)))
++    for mode in run_mode:
++        run(model, mode, num, demo_dataset, logger, args.debug)
+ 
+     logger.info('Demo done.')
+ 
+diff --git a/tools/eval_utils/eval_utils.py b/tools/eval_utils/eval_utils.py
+index 5231701..3a37a93 100644
+--- a/tools/eval_utils/eval_utils.py
++++ b/tools/eval_utils/eval_utils.py
+@@ -4,9 +4,133 @@ import time
+ import numpy as np
+ import torch
+ import tqdm
+-
++from pathlib import Path
+ from pcdet.models import load_data_to_gpu
+ from pcdet.utils import common_utils
++from pathlib import Path
++from scipy.optimize import linear_sum_assignment
++import cv2 
++import torch
++import csv
++import os
++import threading
++import subprocess
++from skimage import io
++import numba
++
++model_labels = {
++    0: "person",
++    1: "bicycle",
++    2: "car",
++    3: "motorbike",
++    5: "bus",
++    6: "train",
++    7: "truck"
++}
++
++def yolo_launch(idx, input_node, output_node, datapath, save_to_file):
++    num_labels = 5 #label_id, x_min, y_min, x_max, y_max
++    input_node.write(str(idx))
++    input_node.flush()
++    print("yolo id {}".format(idx))
++    data = os.read(output_node, 2048)
++    #print('read data len {}'.format(len(data)))
++    if len(data) == 0:
++       print("nodata")
++       time.sleep(0.1)
++
++    bboxes = np.frombuffer(data, dtype=np.uint32).reshape(-1, num_labels)
++    #print(bboxes)
++    bboxes_dict = {
++        'bboxes': bboxes[:, 1:],
++        'classes': bboxes[:, :1],
++    }
++    if not save_to_file:
++        return bboxes_dict, None
++
++    img_file = datapath / 'image_2' / ('%s.png' % str(idx).zfill(6))
++    assert img_file.exists()
++    frame = cv2.imread(str(img_file))
++    yolo_color = (0,255,0)
++
++    for boxid, box in enumerate(bboxes):
++        class_id = box[0]
++        xmin = box[1]
++        ymin = box[2]
++        xmax = box[3]
++        ymax = box[4]
++        det_label = model_labels[class_id]
++        cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), yolo_color, 2)
++        cv2.putText(frame, 'yolo_{}'.format(boxid),
++                    (xmin, ymin - 7), cv2.FONT_HERSHEY_COMPLEX, 0.6, yolo_color, 1)
++        cv2.putText(frame, '{}'.format(det_label),
++                    (xmin+67, ymin - 7), cv2.FONT_HERSHEY_COMPLEX, 0.6, yolo_color, 1)
++
++    return bboxes_dict, frame
++
++def pcl_launch(num, pcd, input_node, cond):
++    cond.acquire()
++
++    for i in range(num):
++        val = cond.wait(10) #if wait 10s and there is no response from pcl, must be something wrong
++        if val:
++            pcd_file = Path(pcd) / ('%s.bin.pcd' % str(i).zfill(6))
++            assert pcd_file.exists()
++            #print ("pcl run on : %s" % str(pcd_file))
++            input_node.write(str(pcd_file))
++            input_node.flush()
++            continue
++        else:
++            print("pcl wait timeout ...!")
++            break
++    cond.release()
++
++def pcl_getresult(output_node):
++    data = os.read(output_node, 2048)
++
++    if len(data) == 0:
++       print("nodata")
++       time.sleep(0.1)
++    pcl_pred = np.frombuffer(data, dtype=np.float32).reshape(-1, 6)#x_min, y_min, z_min, x_max, y_max, z_max
++
++    #print("pcl_getresult, pcl raw data:")
++    #print(pcl_pred)
++    #end_time = int(round(time.time() * 1000))
++    #print('\npcl_run2:', end_time - time1, 'ms')
++
++    pred_pcd_box = [] #x, y, z, w, h, l, angle
++    pred_pcd_boxes = []
++    pred_pcd_scores = []
++    pred_pcd_labels = []
++
++    for idx, pcd in enumerate(pcl_pred):
++        pred_pcd_box = [] #x, y, z, w, h, l, angle
++        pred_pcd_box.append((pcd[0]+pcd[3])/2)
++        pred_pcd_box.append((pcd[1]+pcd[4])/2)
++        pred_pcd_box.append((pcd[2]+pcd[5])/2)
++        pred_pcd_box.append(pcd[3]-pcd[0])
++        pred_pcd_box.append(pcd[4]-pcd[1])
++        pred_pcd_box.append(pcd[5]-pcd[2])
++        pred_pcd_box.append(0) #fake angle result, todo, need calculated from 3D data
++
++        pred_pcd_boxes.append(pred_pcd_box)
++        pred_pcd_scores.append(0.5) #fake scores for pcl
++        pred_pcd_labels.append(1) #fake labels for pcl, 'Car' - 1
++
++    pred_pcd_boxes_tensor = torch.FloatTensor(pred_pcd_boxes)
++    pred_pcd_scores_tensor = torch.FloatTensor(pred_pcd_scores)
++    pred_pcd_labels_tensor = torch.tensor(pred_pcd_labels, dtype=torch.int)
++
++    record_dict = {
++        'pred_boxes': pred_pcd_boxes_tensor,
++        'pred_scores': pred_pcd_scores_tensor,
++        'pred_labels': pred_pcd_labels_tensor,
++    }
++
++    pred_dicts = []
++    pred_dicts.append(record_dict)
++    return pred_dicts       
++
+ 
+ 
+ def statistics_info(cfg, ret_dict, metric, disp_dict):
+@@ -18,11 +142,123 @@ def statistics_info(cfg, ret_dict, metric, disp_dict):
+     disp_dict['recall_%s' % str(min_thresh)] = \
+         '(%d, %d) / %d' % (metric['recall_roi_%s' % str(min_thresh)], metric['recall_rcnn_%s' % str(min_thresh)], metric['gt_num'])
+ 
++@numba.jit(nopython=True)
++def _area(box):
++    return max((box[2] - box[0]), 0) * max((box[3] - box[1]), 0)
+ 
+-def eval_one_epoch(cfg, model, dataloader, epoch_id, logger, dist_test=False, save_to_file=False, result_dir=None):
+-    result_dir.mkdir(parents=True, exist_ok=True)
++@numba.jit(nopython=True)
++def _iou(b1, b2, a1=None, a2=None):
++    if a1 is None:
++        a1 = _area(b1)
++    if a2 is None:
++        a2 = _area(b2)
++    intersection = _area([max(b1[0], b2[0]), max(b1[1], b2[1]),
++                           min(b1[2], b2[2]), min(b1[3], b2[3])])
++
++    u = a1 + a2 - intersection
++    return intersection / u if u > 0 else 0
++
++
++
++def fusion(frameid, bboxes_list, annos, output_path, datapath, save_to_file):
++
++    bboxes = bboxes_list['bboxes'] #2D bbox of camera
++    classes = bboxes_list['classes']
++
++    bboxes_lidar = annos[0]['bbox'] #2D bbox of lidar by projecting
++    lboxes = annos[0]['boxes_lidar'] #3D bbox of lidar
++    cost_matrix = np.zeros((len(bboxes), len(bboxes_lidar)), dtype=np.float32)
++
++    for i, idx in enumerate(bboxes):
++        for j, d in enumerate(bboxes_lidar):
++            iou_dist = _iou(idx, d)
++            cost_matrix[i, j] = iou_dist
++
++    cost = cost_matrix
++    #print ("cost matric is: ")
++    #print (cost)
++
++    row_ind, col_ind = linear_sum_assignment(cost, maximize=True)
++    #print ("row is: ")
++    #print (row_ind)
++    #print ("col is: ")
++    #print (col_ind)
++
++    #print ("sum of cost is: ")
++    #print (cost[row_ind, col_ind].sum())
++    #print ("assignment cost is: ")
++    #print (cost[row_ind, col_ind])
++
++    threshold = 0.1
++    selected = []
++    for i in range(len(row_ind)):
++        if cost[row_ind[i], col_ind[i]] > threshold:
++            selected.append(i)
++    seleted_bboxes = bboxes[selected]
+ 
+-    final_output_dir = result_dir / 'final_result' / 'data'
++    if not save_to_file: 
++        return None
++
++    img_file = datapath / 'image_2' / ('%s.png' % str(frameid).zfill(6))
++    assert img_file.exists()
++    cur_img_file = output_path / ('fuse_%s.png' % str(frameid).zfill(6))
++    frame = cv2.imread(str(img_file))
++
++    #BGR
++    lidar_color = (255,255,255)
++    yolo_color = (0,255,0)
++    #fuse_color = (200,0,200)
++
++    for idx in range(len(seleted_bboxes)):
++        xmin = int(seleted_bboxes[idx][0])
++        ymin = int(seleted_bboxes[idx][1])
++        xmax = int(seleted_bboxes[idx][2])
++        ymax = int(seleted_bboxes[idx][3])
++
++        x_color = int(((lboxes[col_ind[selected[idx]]][0] if lboxes[col_ind[selected[idx]]][0] <= 70 else 70)/70) * 255)
++        lidar_color = (255, x_color, x_color)
++        classid = classes[row_ind[selected[idx]]]
++        det_label = model_labels[classid[0]]
++
++        cv2.putText(frame, '{}'.format(det_label),
++                (xmin+67, ymin - 7), cv2.FONT_HERSHEY_COMPLEX, 0.6, yolo_color, 1)
++        cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), lidar_color, 2)
++        cv2.putText(frame, 'yolo_{}'.format(row_ind[selected[idx]]), (xmin, ymin - 7),
++                cv2.FONT_HERSHEY_COMPLEX, 0.6, yolo_color, 1)
++        cv2.putText(frame, 'lidar_{}'.format(col_ind[selected[idx]]), (xmin, ymin + 17),
++                cv2.FONT_HERSHEY_COMPLEX, 0.6, lidar_color, 1)
++
++    cv2.imwrite(str(cur_img_file), frame)
++    print ("Save fusion result to: %s" % cur_img_file)
++    return frame
++
++def yolo_start(cond, num, filepath):
++    cond.acquire()
++    yolo_p = subprocess.Popen(["./object_detection_demo", "-at", "yolo",
++                                "-i", filepath,
++                                "-m", "./yolo_v3.xml",
++                                "-d", "GPU", "-no_show",
++                                "-num", str(num), "-nireq", "1"]) #vscode need update path
++    print("-----------------yolo server start\n")
++    cond.wait()
++    yolo_p.terminate()
++    print("-----------------yolo server terminate")
++
++def pcl_start(cond, num, filepath):
++    #start pcl server, communicate with it by pipe file
++    cond.acquire()
++    pcl_p = subprocess.Popen(["./pcl_object_detection", "-num", str(num), "-pcd", filepath]) #vscode need update path
++    print("-----------------pcl server start\n")
++    cond.wait()
++    pcl_p.terminate()
++    print("-----------------pcl server terminate")
++
++def eval_one_epoch(num, cfg,
++    model, dataloader, epoch_id, logger,
++    dist_test=False, save_to_file=False, result_dir=None):
++
++    result_dir.mkdir(parents=True, exist_ok=True)
++    final_output_dir = Path(__file__).resolve().parents[1] / 'output'
+     if save_to_file:
+         final_output_dir.mkdir(parents=True, exist_ok=True)
+ 
+@@ -35,7 +271,17 @@ def eval_one_epoch(cfg, model, dataloader, epoch_id, logger, dist_test=False, sa
+ 
+     dataset = dataloader.dataset
+     class_names = dataset.class_names
++    datapath = dataset.get_datapath()
+     det_annos = []
++    img_set = []
++
++    print('Reading images needs some time...\n')
++    for dataid in range(num+1 if num else len(dataset)+1):
++        img_file = datapath / 'image_2' / ('%s.png' % str(dataid).zfill(6))
++        cam_img = io.imread(img_file)
++        img_set.append(cam_img)
++    print('There are {} images in total.\n'.format(dataid))
++    dataset.set_dataptr(img_set)
+ 
+     logger.info('*************** EPOCH %s EVALUATION *****************' % epoch_id)
+     if dist_test:
+@@ -50,22 +296,125 @@ def eval_one_epoch(cfg, model, dataloader, epoch_id, logger, dist_test=False, sa
+ 
+     if cfg.LOCAL_RANK == 0:
+         progress_bar = tqdm.tqdm(total=len(dataloader), leave=True, desc='eval', dynamic_ncols=True)
++
++    pcd_path = datapath / 'velodyne_reduced_pcd'
++    if not os.path.exists(pcd_path):
++        print("{} : does not exist".format(pcd_path))
++        return {}
++    file_num = num if num else len(dataset)
++    cond_sv = threading.Condition()
++    pcl_server = threading.Thread(target=pcl_start, args=(cond_sv, file_num, pcd_path,))
++    pcl_server.start()
++
++    img_path = datapath / 'image_2'
++    if not os.path.exists(img_path):
++        print("{} : does not exist".format(pcd_path))
++        return {}
++    cond_sv_yolo = threading.Condition()
++    yolo_server = threading.Thread(target=yolo_start, args=(cond_sv_yolo, file_num, img_path,))
++    yolo_server.start()
++
++    FILE_PATH = str(Path(__file__).resolve().parents[2]/'tools'/'file.fifo') #vscode need update the path
++    OBJECT_DATA = str(Path(__file__).resolve().parents[2]/'tools'/'data.fifo')
++    FILE_PATH_YOLO = str(Path(__file__).resolve().parents[2]/'tools'/'file_yolo.fifo')
++    OBJECT_DATA_YOLO = str(Path(__file__).resolve().parents[2]/'tools'/'data_yolo.fifo')
++    
++    if not os.path.exists(FILE_PATH):
++        os.mkfifo(FILE_PATH, 0o666)
++    if not os.path.exists(OBJECT_DATA):
++        os.mkfifo(OBJECT_DATA, 0o666)
++    pcl_input = open(FILE_PATH, 'w') #TODO, why open and why os.open?
++    pcl_output = os.open(OBJECT_DATA, os.O_RDONLY)
++
++    if not os.path.exists(FILE_PATH_YOLO):
++        os.mkfifo(FILE_PATH_YOLO, 0o666)
++    if not os.path.exists(OBJECT_DATA_YOLO):
++        os.mkfifo(OBJECT_DATA_YOLO, 0o666)
++    yolo_input = open(FILE_PATH_YOLO, 'w')
++    yolo_output = os.open(OBJECT_DATA_YOLO, os.O_RDONLY)
++
++    cond = threading.Condition()
++    pcl_thread = threading.Thread(target=pcl_launch,
++            args=(num if num else len(dataset), pcd_path, pcl_input, cond,))
++    pcl_thread.start()
++
+     start_time = time.time()
++    #yolo_time = 0
++    #pcl_time = 0
++    #fuse_time = 0
++    #pre_time = 0
++    #pre_start_time = time.time()
++    start_count = 1 #start time counting from start_count+1 frame
++
+     for i, batch_dict in enumerate(dataloader):
++        if num > 0: 
++            if i >= num:
++                break
++        #if i > start_count:
++        #    pre_time += time.time() - pre_start_time
++        #pcl_start_time = time.time()
++        cond.acquire()
++        cond.notify()
++        cond.release()
++
++        #yolo_start_time = time.time()
++        bboxes_list, img_cam = yolo_launch(i, yolo_input, yolo_output, datapath, save_to_file)
++        #yolo_time += time.time() - yolo_start_time
++        #obj_detect.frameid = i
++        #bboxes_list, img_cam = obj_detect.obj_detect_run()
++
+         load_data_to_gpu(batch_dict)
+-        with torch.no_grad():
+-            pred_dicts, ret_dict = model(batch_dict)
+-        disp_dict = {}
++        batch_dict['frameid'] = i
+ 
+-        statistics_info(cfg, ret_dict, metric, disp_dict)
+-        annos = dataset.generate_prediction_dicts(
++        if 1:
++            pred_dicts = pcl_getresult(pcl_output)
++            #pcl_time += time.time() - pcl_start_time
++        else:
++            with torch.no_grad():
++                pred_dicts = model.latency(batch_dict) #not test this path with pointpillars
++
++        disp_dict = {}
++        # statistics_info(cfg, ret_dict, metric, disp_dict) #TODO, need to add recall rate without CUDA
++        annos, img_lidar = dataset.generate_prediction_dicts(
+             batch_dict, pred_dicts, class_names,
+-            output_path=final_output_dir if save_to_file else None
+-        )
++            output_path=final_output_dir if save_to_file else None)
++
++        #fuse_start_time = time.time()
++        if bboxes_list:
++            img_fuse = fusion(i, bboxes_list, annos, final_output_dir, datapath, save_to_file)
++        #fuse_time += time.time()-fuse_start_time
++
++        if save_to_file:
++            yolo_file = final_output_dir / ('yolo_%s.png' % str(i).zfill(6))
++            cv2.imwrite(str(yolo_file), img_cam)
++            vis = np.concatenate((img_cam, img_lidar, img_fuse), axis=0)
++            out_file = final_output_dir / ('merge_%s.png' % str(i).zfill(6))
++            cv2.imwrite(str(out_file), vis)
++            print ("Save merge result to: %s" % out_file)
++
+         det_annos += annos
+-        if cfg.LOCAL_RANK == 0:
+-            progress_bar.set_postfix(disp_dict)
+-            progress_bar.update()
++        #if cfg.LOCAL_RANK == 0:
++        #    progress_bar.set_postfix(disp_dict)
++        #    progress_bar.update()
++        #pre_start_time = time.time()
++        if i == start_count:
++            start_time = time.time()
++
++    end_time = time.time()
++
++    cond_sv.acquire()
++    cond_sv.notify()
++    cond_sv.release()
++    time.sleep(1)
++    pcl_input.close()
++    os.close(pcl_output)
++
++    cond_sv_yolo.acquire()
++    cond_sv_yolo.notify()
++    cond_sv_yolo.release()
++    time.sleep(1)
++    yolo_input.close()
++    os.close(yolo_output)
+ 
+     if cfg.LOCAL_RANK == 0:
+         progress_bar.close()
+@@ -75,9 +424,18 @@ def eval_one_epoch(cfg, model, dataloader, epoch_id, logger, dist_test=False, sa
+         det_annos = common_utils.merge_results_dist(det_annos, len(dataset), tmpdir=result_dir / 'tmpdir')
+         metric = common_utils.merge_results_dist([metric], world_size, tmpdir=result_dir / 'tmpdir')
+ 
+-    logger.info('*************** Performance of EPOCH %s *****************' % epoch_id)
+-    sec_per_example = (time.time() - start_time) / len(dataloader.dataset)
+-    logger.info('Generate label finished(sec_per_example: %.4f second).' % sec_per_example)
++    #logger.info('*************** Performance of EPOCH %s *****************' % epoch_id)
++    #logger.info('*************** len %s *****************' % len(dataset))
++    #sec_per_example = (time.time() - start_time) / len(dataset)
++    #logger.info('Generate label finished(sec_per_example: %.2f ms).\n' % sec_per_example*1000)
++    print("\ntotal {} frame takes {:.2f}ms, {:.2f}ms per frame, fps = {:.2f}\n\n".format(
++                i-start_count-1, (end_time-start_time)*1000,
++                (end_time-start_time)*1000/(i-start_count-1),
++                (i-start_count-1)/(end_time-start_time)))
++    #print("pcl\t\t takes avg {:.2f}ms\t on each frame".format(pcl_time*1000/i))
++    #print("yolo\t\t takes avg {:.2f}ms\t on each frame".format(yolo_time*1000/i))
++    #print("fuse\t\t takes avg {:.2f}ms\t on each frame".format(fuse_time*1000/i))
++    #print("preprocess\t takes avg {:.2f}ms\t on each frame\n".format(pre_time*1000/(i-start_count-1)))
+ 
+     if cfg.LOCAL_RANK != 0:
+         return {}
+@@ -93,20 +451,21 @@ def eval_one_epoch(cfg, model, dataloader, epoch_id, logger, dist_test=False, sa
+     for cur_thresh in cfg.MODEL.POST_PROCESSING.RECALL_THRESH_LIST:
+         cur_roi_recall = metric['recall_roi_%s' % str(cur_thresh)] / max(gt_num_cnt, 1)
+         cur_rcnn_recall = metric['recall_rcnn_%s' % str(cur_thresh)] / max(gt_num_cnt, 1)
+-        logger.info('recall_roi_%s: %f' % (cur_thresh, cur_roi_recall))
+-        logger.info('recall_rcnn_%s: %f' % (cur_thresh, cur_rcnn_recall))
++        #logger.info('recall_roi_%s: %f' % (cur_thresh, cur_roi_recall))
++        #logger.info('recall_rcnn_%s: %f' % (cur_thresh, cur_rcnn_recall))
+         ret_dict['recall/roi_%s' % str(cur_thresh)] = cur_roi_recall
+         ret_dict['recall/rcnn_%s' % str(cur_thresh)] = cur_rcnn_recall
+ 
+     total_pred_objects = 0
+     for anno in det_annos:
+         total_pred_objects += anno['name'].__len__()
+-    logger.info('Average predicted number of objects(%d samples): %.3f'
+-                % (len(det_annos), total_pred_objects / max(1, len(det_annos))))
++    #logger.info('Average predicted number of objects(%d samples): %.3f'
++    #            % (len(det_annos), total_pred_objects / max(1, len(det_annos))))
+ 
+     with open(result_dir / 'result.pkl', 'wb') as f:
+         pickle.dump(det_annos, f)
+ 
++    """
+     result_str, result_dict = dataset.evaluation(
+         det_annos, class_names,
+         eval_metric=cfg.MODEL.POST_PROCESSING.EVAL_METRIC,
+@@ -115,7 +474,7 @@ def eval_one_epoch(cfg, model, dataloader, epoch_id, logger, dist_test=False, sa
+ 
+     logger.info(result_str)
+     ret_dict.update(result_dict)
+-
++    """
+     logger.info('Result is save to %s' % result_dir)
+     logger.info('****************Evaluation done.*****************')
+     return ret_dict
+diff --git a/tools/pointpillar.yaml b/tools/pointpillar.yaml
+new file mode 100644
+index 0000000..24e3c76
+--- /dev/null
++++ b/tools/pointpillar.yaml
+@@ -0,0 +1,144 @@
++CLASS_NAMES: ['Car']
++
++DATA_CONFIG: 
++    _BASE_CONFIG_: ./cfgs/dataset_configs/kitti_dataset.yaml
++    POINT_CLOUD_RANGE: [0, -39.68, -3, 69.12, 39.68, 1]
++    DATA_PROCESSOR:
++        - NAME: mask_points_and_boxes_outside_range
++          REMOVE_OUTSIDE_BOXES: True
++
++        - NAME: shuffle_points
++          SHUFFLE_ENABLED: {
++            'train': True,
++            'test': False
++          }
++
++        - NAME: transform_points_to_voxels
++          VOXEL_SIZE: [0.16, 0.16, 4]
++          MAX_POINTS_PER_VOXEL: 100
++          MAX_NUMBER_OF_VOXELS: {
++            'train': 16000,
++            'test': 12000
++          }
++    DATA_AUGMENTOR:
++        DISABLE_AUG_LIST: ['placeholder']
++        AUG_CONFIG_LIST:
++            - NAME: gt_sampling
++              USE_ROAD_PLANE: True
++              DB_INFO_PATH:
++                  - kitti_dbinfos_train.pkl
++              PREPARE: {
++                 filter_by_min_points: ['Car:5', 'Pedestrian:5', 'Cyclist:5'],
++                 filter_by_difficulty: [-1],
++              }
++
++              SAMPLE_GROUPS: ['Car:15','Pedestrian:15', 'Cyclist:15']
++              NUM_POINT_FEATURES: 4
++              DATABASE_WITH_FAKELIDAR: False
++              REMOVE_EXTRA_WIDTH: [0.0, 0.0, 0.0]
++              LIMIT_WHOLE_SCENE: False
++
++            - NAME: random_world_flip
++              ALONG_AXIS_LIST: ['x']
++
++            - NAME: random_world_rotation
++              WORLD_ROT_ANGLE: [-0.78539816, 0.78539816]
++
++            - NAME: random_world_scaling
++              WORLD_SCALE_RANGE: [0.95, 1.05]
++
++MODEL:
++    NAME: PointPillar
++
++    VFE:
++        NAME: PillarVFE
++        WITH_DISTANCE: False
++        USE_ABSLOTE_XYZ: True
++        USE_NORM: True
++        NUM_FILTERS: [64]
++
++    MAP_TO_BEV:
++        NAME: PointPillarScatter
++        NUM_BEV_FEATURES: 64
++
++    BACKBONE_2D:
++        NAME: BaseBEVBackbone
++        LAYER_NUMS: [3, 5, 5]
++        LAYER_STRIDES: [2, 2, 2]
++        NUM_FILTERS: [64, 128, 256]
++        UPSAMPLE_STRIDES: [1, 2, 4]
++        NUM_UPSAMPLE_FILTERS: [128, 128, 128]
++
++    DENSE_HEAD:
++        NAME: AnchorHeadSingle
++        CLASS_AGNOSTIC: False
++
++        USE_DIRECTION_CLASSIFIER: True
++        DIR_OFFSET: 0.78539
++        DIR_LIMIT_OFFSET: 0.0
++        NUM_DIR_BINS: 2
++
++        ANCHOR_GENERATOR_CONFIG: [
++            {
++                'class_name': 'Car',
++                'anchor_sizes': [[1.6, 3.9, 1.56]],
++                'anchor_rotations': [0, 1.57],
++                'anchor_bottom_heights': [-1.78],
++                'align_center': True,
++                'feature_map_stride': 2,
++                'matched_threshold': 0.6,
++                'unmatched_threshold': 0.45
++            }
++        ]
++
++        TARGET_ASSIGNER_CONFIG:
++            NAME: AxisAlignedTargetAssigner
++            POS_FRACTION: -1.0
++            SAMPLE_SIZE: 512
++            NORM_BY_NUM_EXAMPLES: False
++            MATCH_HEIGHT: False
++            BOX_CODER: ResidualCoder
++
++        LOSS_CONFIG:
++            LOSS_WEIGHTS: {
++                'cls_weight': 1.0,
++                'loc_weight': 2.0,
++                'dir_weight': 0.2,
++                'code_weights': [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
++            }
++
++    POST_PROCESSING:
++        RECALL_THRESH_LIST: [0.3, 0.5, 0.7]
++        SCORE_THRESH: 0.2
++        OUTPUT_RAW_SCORE: False
++
++        EVAL_METRIC: kitti
++
++        NMS_CONFIG:
++            MULTI_CLASSES_NMS: False
++            NMS_TYPE: nms_gpu
++            NMS_THRESH: 0.1
++            NMS_PRE_MAXSIZE: 1000
++            NMS_POST_MAXSIZE: 300
++
++
++OPTIMIZATION:
++    BATCH_SIZE_PER_GPU: 4
++    NUM_EPOCHS: 80
++
++    OPTIMIZER: adam_onecycle
++    LR: 0.003
++    WEIGHT_DECAY: 0.01
++    MOMENTUM: 0.9
++
++    MOMS: [0.95, 0.85]
++    PCT_START: 0.4
++    DIV_FACTOR: 10
++    DECAY_STEP_LIST: [35, 45]
++    LR_DECAY: 0.1
++    LR_CLIP: 0.0000001
++
++    LR_WARMUP: False
++    WARMUP_EPOCH: 1
++
++    GRAD_NORM_CLIP: 10
+diff --git a/tools/test.py b/tools/test.py
+index cf1ed10..099a1e9 100644
+--- a/tools/test.py
++++ b/tools/test.py
+@@ -15,14 +15,15 @@ from pcdet.config import cfg, cfg_from_list, cfg_from_yaml_file, log_config_to_f
+ from pcdet.datasets import build_dataloader
+ from pcdet.models import build_network
+ from pcdet.utils import common_utils
+-
++#from object_detect.object_detection_demo import ObjDetect
++from argparse import ArgumentParser, SUPPRESS
+ 
+ def parse_config():
+     parser = argparse.ArgumentParser(description='arg parser')
+     parser.add_argument('--cfg_file', type=str, default=None, help='specify the config for training')
+ 
+     parser.add_argument('--batch_size', type=int, default=None, required=False, help='batch size for training')
+-    parser.add_argument('--workers', type=int, default=4, help='number of workers for dataloader')
++    parser.add_argument('--workers', type=int, default=0, help='number of workers for dataloader')
+     parser.add_argument('--extra_tag', type=str, default='default', help='extra tag for this experiment')
+     parser.add_argument('--ckpt', type=str, default=None, help='checkpoint to start from')
+     parser.add_argument('--launcher', choices=['none', 'pytorch', 'slurm'], default='none')
+@@ -37,6 +38,7 @@ def parse_config():
+     parser.add_argument('--eval_all', action='store_true', default=False, help='whether to evaluate all checkpoints')
+     parser.add_argument('--ckpt_dir', type=str, default=None, help='specify a ckpt directory to be evaluated if needed')
+     parser.add_argument('--save_to_file', action='store_true', default=False, help='')
++    parser.add_argument('--num', type=int, default=0, help='specify how many files are used. 0 means all, default set to 0')
+ 
+     args = parser.parse_args()
+ 
+@@ -54,12 +56,12 @@ def parse_config():
+ 
+ def eval_single_ckpt(model, test_loader, args, eval_output_dir, logger, epoch_id, dist_test=False):
+     # load checkpoint
+-    model.load_params_from_file(filename=args.ckpt, logger=logger, to_cpu=dist_test)
+-    model.cuda()
++    #model.load_params_from_file(filename=args.ckpt, logger=logger, to_cpu=dist_test)
++    #model.cuda()
+ 
+     # start evaluation
+     eval_utils.eval_one_epoch(
+-        cfg, model, test_loader, epoch_id, logger, dist_test=dist_test,
++        args.num, cfg, model, test_loader, epoch_id, logger, dist_test=dist_test,
+         result_dir=eval_output_dir, save_to_file=args.save_to_file
+     )
+ 
+@@ -132,6 +134,9 @@ def repeat_eval_ckpt(model, test_loader, args, eval_output_dir, logger, ckpt_dir
+ 
+ 
+ def main():
++    affinity_mask = {0, 4, 1, 5}
++    os.sched_setaffinity(0, affinity_mask)
++
+     args, cfg = parse_config()
+     if args.launcher == 'none':
+         dist_test = False
+@@ -143,25 +148,18 @@ def main():
+         dist_test = True
+ 
+     if args.batch_size is None:
+-        args.batch_size = cfg.OPTIMIZATION.BATCH_SIZE_PER_GPU
++        #args.batch_size = cfg.OPTIMIZATION.BATCH_SIZE_PER_GPU
++        args.batch_size = 1
+     else:
+         assert args.batch_size % total_gpus == 0, 'Batch size should match the number of gpus'
+         args.batch_size = args.batch_size // total_gpus
+ 
+-    output_dir = cfg.ROOT_DIR / 'output' / cfg.EXP_GROUP_PATH / cfg.TAG / args.extra_tag
++    output_dir = cfg.ROOT_DIR / 'logger'
+     output_dir.mkdir(parents=True, exist_ok=True)
+ 
+     eval_output_dir = output_dir / 'eval'
+-
+-    if not args.eval_all:
+-        num_list = re.findall(r'\d+', args.ckpt) if args.ckpt is not None else []
+-        epoch_id = num_list[-1] if num_list.__len__() > 0 else 'no_number'
+-        eval_output_dir = eval_output_dir / ('epoch_%s' % epoch_id) / cfg.DATA_CONFIG.DATA_SPLIT['test']
+-    else:
+-        eval_output_dir = eval_output_dir / 'eval_all_default'
+-
+-    if args.eval_tag is not None:
+-        eval_output_dir = eval_output_dir / args.eval_tag
++    num_list = re.findall(r'\d+', args.ckpt) if args.ckpt is not None else []
++    epoch_id = num_list[-1] if num_list.__len__() > 0 else 'no_number'
+ 
+     eval_output_dir.mkdir(parents=True, exist_ok=True)
+     log_file = eval_output_dir / ('log_eval_%s.txt' % datetime.datetime.now().strftime('%Y%m%d-%H%M%S'))
+@@ -188,11 +186,14 @@ def main():
+     )
+ 
+     model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=test_set)
++    ie = model.get_ie()
++    #obj_detect = ObjDetect(args, logger, ie)
++
++    #pcl_server = threading.Thread(target=pcl_start)
++    #pcl_server.start()
++
+     with torch.no_grad():
+-        if args.eval_all:
+-            repeat_eval_ckpt(model, test_loader, args, eval_output_dir, logger, ckpt_dir, dist_test=dist_test)
+-        else:
+-            eval_single_ckpt(model, test_loader, args, eval_output_dir, logger, epoch_id, dist_test=dist_test)
++        eval_single_ckpt(model, test_loader, args, eval_output_dir, logger, epoch_id, dist_test=dist_test)
+ 
+ 
+ if __name__ == '__main__':
+-- 
+2.25.1
+
