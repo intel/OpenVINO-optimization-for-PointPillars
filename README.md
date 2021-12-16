@@ -129,7 +129,7 @@ git checkout pcl-1.10.0
 cp <your_folder>/pointpillars-on-openvino/tbb/0001-cluster-extraction-TBB.patch ./
 git am 0001-cluster-extraction-TBB.patch
 ```
-- Compile and install PCL
+- Compile and install PCL <br>
 Before compiling, make sure you have installed the mandatory libraries, https://pcl.readthedocs.io/projects/tutorials/en/latest/compiling_pcl_posix.html#mandatory.
 ```
 mkdir build
