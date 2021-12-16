@@ -124,12 +124,13 @@ Please follow the setup steps in [Setup code base](#codebase) and [Compile libs]
 - Setup PCL code base
 ```
 git clone https://github.com/PointCloudLibrary/pcl.git
-git checkout pcl-1.10.0
 cd pcl
+git checkout pcl-1.10.0
 cp <your_folder>/pointpillars-on-openvino/tbb/0001-cluster-extraction-TBB.patch ./
 git am 0001-cluster-extraction-TBB.patch
 ```
 - Compile and install PCL
+Before compiling, make sure you have installed the mandatory libraries, https://pcl.readthedocs.io/projects/tutorials/en/latest/compiling_pcl_posix.html#mandatory.
 ```
 mkdir build
 cd build
