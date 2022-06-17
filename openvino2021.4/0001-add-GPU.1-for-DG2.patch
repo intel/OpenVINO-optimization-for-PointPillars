@@ -1,0 +1,68 @@
+From 06c4dbe73dd2b8a3794b2ed2cc3b8b7591942eb4 Mon Sep 17 00:00:00 2001
+From: "Xu, Qing" <qing.xu@intel.com>
+Date: Wed, 2 Mar 2022 15:37:10 +0800
+Subject: [PATCH 1/2] add GPU.1 for DG2
+
+verified on TGL_H + DG2 B0
+
+Signed-off-by: Xu, Qing <qing.xu@intel.com>
+---
+ pcdet/models/backbones_2d/base_bev_backbone.py | 2 +-
+ pcdet/models/backbones_3d/vfe/pillar_vfe.py    | 2 +-
+ tools/cfgs/dataset_configs/kitti_dataset.yaml  | 2 +-
+ tools/eval_utils/eval_utils.py                 | 2 +-
+ 4 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/pcdet/models/backbones_2d/base_bev_backbone.py b/pcdet/models/backbones_2d/base_bev_backbone.py
+index 4a18c5f..d775d72 100644
+--- a/pcdet/models/backbones_2d/base_bev_backbone.py
++++ b/pcdet/models/backbones_2d/base_bev_backbone.py
+@@ -90,7 +90,7 @@ class BaseBEVBackbone(nn.Module):
+         model_file_rpn = str(Path(__file__).resolve().parents[3] / 'tools'/'rpn.xml')
+         model_weight_rpn = str(Path(__file__).resolve().parents[3] / 'tools'/'rpn.bin')
+         self.net_rpn = openvino_ie.read_network(model_file_rpn, model_weight_rpn)
+-        self.exec_net_rpn = openvino_ie.load_network(network=self.net_rpn, device_name="GPU")
++        self.exec_net_rpn = openvino_ie.load_network(network=self.net_rpn, device_name="GPU.1")
+ 
+     def forward_backbone2d(self, data_dict):
+         """
+diff --git a/pcdet/models/backbones_3d/vfe/pillar_vfe.py b/pcdet/models/backbones_3d/vfe/pillar_vfe.py
+index 4be8989..6e83e5d 100644
+--- a/pcdet/models/backbones_3d/vfe/pillar_vfe.py
++++ b/pcdet/models/backbones_3d/vfe/pillar_vfe.py
+@@ -90,7 +90,7 @@ class PillarVFE(VFETemplate):
+         model_file_pfe = str(Path(__file__).resolve().parents[4] / 'tools'/'pfe.xml')
+         model_weight_pfe = str(Path(__file__).resolve().parents[4] / 'tools'/'pfe.bin')
+         self.net_pfe = openvino_ie.read_network(model_file_pfe, model_weight_pfe)
+-        self.exec_net_pfe = openvino_ie.load_network(network=self.net_pfe, device_name="GPU")
++        self.exec_net_pfe = openvino_ie.load_network(network=self.net_pfe, device_name="GPU.1")
+ 
+         self.frame_id = 0
+         self.event = threading.Event()
+diff --git a/tools/cfgs/dataset_configs/kitti_dataset.yaml b/tools/cfgs/dataset_configs/kitti_dataset.yaml
+index c5ca452..00c46fb 100644
+--- a/tools/cfgs/dataset_configs/kitti_dataset.yaml
++++ b/tools/cfgs/dataset_configs/kitti_dataset.yaml
+@@ -1,5 +1,5 @@
+ DATASET: 'KittiDataset'
+-DATA_PATH: '/home/iotg/work/kitti_dataset'
++DATA_PATH: '/home/dg2/kitti_dataset'
+ 
+ POINT_CLOUD_RANGE: [0, -40, -3, 70.4, 40, 1]
+ 
+diff --git a/tools/eval_utils/eval_utils.py b/tools/eval_utils/eval_utils.py
+index 3a37a93..dc44469 100644
+--- a/tools/eval_utils/eval_utils.py
++++ b/tools/eval_utils/eval_utils.py
+@@ -237,7 +237,7 @@ def yolo_start(cond, num, filepath):
+     yolo_p = subprocess.Popen(["./object_detection_demo", "-at", "yolo",
+                                 "-i", filepath,
+                                 "-m", "./yolo_v3.xml",
+-                                "-d", "GPU", "-no_show",
++                                "-d", "GPU.1", "-no_show",
+                                 "-num", str(num), "-nireq", "1"]) #vscode need update path
+     print("-----------------yolo server start\n")
+     cond.wait()
+-- 
+2.25.1
+

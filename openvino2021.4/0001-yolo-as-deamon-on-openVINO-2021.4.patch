@@ -1,0 +1,319 @@
+From 88821e43d1919751aca0e8986189613e499c17c0 Mon Sep 17 00:00:00 2001
+From: "Xu, Qing" <qing.xu@intel.com>
+Date: Wed, 2 Mar 2022 15:23:43 +0800
+Subject: [PATCH] yolo as deamon on openVINO 2021.4
+
+1. verified --save_to_file, correct
+2. verified GPU.1, correct
+3. Known issue: failed at kitti training dataste 29th image, error
+log as below:
+
+yolo id 29
+nodata
+Exception in thread Thread-4:
+Traceback (most recent call last):
+  File "/usr/lib/python3.8/threading.py", line 932, in _bootstrap_inner
+    self.run()
+  File "/usr/lib/python3.8/threading.py", line 870, in run
+    self._target(*self._args, **self._kwargs)
+  File "/home/dg2/git/OpenPCDet/tools/eval_utils/eval_utils.py", line 81, in pcl_launch
+    input_node.flush()
+BrokenPipeError: [Errno 32] Broken pipe
+
+Signed-off-by: Xu, Qing <qing.xu@intel.com>
+---
+ object_detection_demo/cpp/main.cpp | 155 +++++++++++++++++++++++++++--
+ 1 file changed, 147 insertions(+), 8 deletions(-)
+
+diff --git a/object_detection_demo/cpp/main.cpp b/object_detection_demo/cpp/main.cpp
+index 8cf8b4e..26fbd94 100644
+--- a/object_detection_demo/cpp/main.cpp
++++ b/object_detection_demo/cpp/main.cpp
+@@ -19,6 +19,11 @@
+ #include <string>
+ #include <numeric>
+ #include <random>
++#include <stdio.h>
++#include <stdlib.h>
++#include <unistd.h>
++#include <sys/stat.h>
++#include <fcntl.h>
+ 
+ #include <monitors/presenter.h>
+ #include <utils/ocv_common.hpp>
+@@ -39,6 +44,10 @@
+ #include <models/detection_model_ssd.h>
+ #include <models/detection_model_yolo.h>
+ 
++#include <sched.h>
++#include <sys/sysinfo.h>
++
++
+ DEFINE_INPUT_FLAGS
+ DEFINE_OUTPUT_FLAGS
+ 
+@@ -66,6 +75,7 @@ static const char no_show_message[] = "Optional. Don't show output.";
+ static const char utilization_monitors_message[] = "Optional. List of monitors to show initially.";
+ static const char iou_thresh_output_message[] = "Optional. Filtering intersection over union threshold for overlapping boxes.";
+ static const char yolo_af_message[] = "Optional. Use advanced postprocessing/filtering algorithm for YOLO.";
++static const char num_message[] = "Required. Number of input file.";
+ static const char output_resolution_message[] = "Optional. Specify the maximum output window resolution "
+     "in (width x height) format. Example: 1280x720. Input frame size used by default.";
+ static const char anchors_message[] = "Optional. A comma separated list of anchors. "
+@@ -73,6 +83,7 @@ static const char anchors_message[] = "Optional. A comma separated list of ancho
+ static const char masks_message[] = "Optional. A comma separated list of mask for anchors. "
+     "By default used default masks for model. Only for YOLOV4 architecture type.";
+ 
++
+ DEFINE_bool(h, false, help_message);
+ DEFINE_string(at, "", at_message);
+ DEFINE_string(m, "", model_message);
+@@ -90,7 +101,8 @@ DEFINE_uint32(nthreads, 0, num_threads_message);
+ DEFINE_string(nstreams, "", num_streams_message);
+ DEFINE_bool(no_show, false, no_show_message);
+ DEFINE_string(u, "", utilization_monitors_message);
+-DEFINE_bool(yolo_af, true, yolo_af_message);
++DEFINE_bool(yolo_af, false, yolo_af_message);
++DEFINE_uint32(num, 0, num_message);
+ DEFINE_string(output_resolution, "", output_resolution_message);
+ DEFINE_string(anchors, "", anchors_message);
+ DEFINE_string(masks, "", masks_message);
+@@ -223,11 +235,33 @@ bool ParseAndCheckCommandLine(int argc, char *argv[]) {
+     if (!FLAGS_output_resolution.empty() && FLAGS_output_resolution.find("x") == std::string::npos) {
+         throw std::logic_error("Correct format of -output_resolution parameter is \"width\"x\"height\".");
+     }
++
++    if (FLAGS_num == 0) {
++        throw std::logic_error("Parameter -num is not set");
++    }
+     return true;
+ }
+ 
++#define _FILE_PATH "./file_yolo.fifo"
++#define _OBJECT_DATA "./data_yolo.fifo"
++#define INPUT_SIZE 64
++#define OUTPUT_SIZE 100
++#define BBOX_INFO 5 // label_id, x_min, y_min, x_max, y_max
++
++bool isValidLabel(unsigned int labelID) {
++    static const unsigned int valid_labels[7] = {0, 1, 2, 3, 5, 6, 7}; //person, bicycle, car, motorbike, bus, train, truck
++    for (int i = 0; i < 7; i++) {
++        if (valid_labels[i] == labelID)
++            return true;
++    }
++    return false;
++}
++
++cv::Mat renderDetectionData(const DetectionResult& result, const ColorPalette& palette,
++    OutputTransform& outputTransform, unsigned int *bboxes, int *valid_num) {
++
+ // Input image is stored inside metadata, as we put it there during submission stage
+-cv::Mat renderDetectionData(DetectionResult& result, const ColorPalette& palette, OutputTransform& outputTransform) {
++//cv::Mat renderDetectionData(DetectionResult& result, const ColorPalette& palette, OutputTransform& outputTransform) {
+     if (!result.metaData) {
+         throw std::invalid_argument("Renderer: metadata is null");
+     }
+@@ -237,12 +271,12 @@ cv::Mat renderDetectionData(DetectionResult& result, const ColorPalette& palette
+     if (outputImg.empty()) {
+         throw std::invalid_argument("Renderer: image provided in metadata is empty");
+     }
+-    outputTransform.resize(outputImg);
++    //outputTransform.resize(outputImg);
+     // Visualizing result data over source image
+     if (FLAGS_r) {
+         slog::info << " Class ID  | Confidence | XMIN | YMIN | XMAX | YMAX " << slog::endl;
+     }
+-
++    int i = 0;
+     for (auto& obj : result.objects) {
+         if (FLAGS_r) {
+             slog::info << " "
+@@ -254,7 +288,19 @@ cv::Mat renderDetectionData(DetectionResult& result, const ColorPalette& palette
+                 << std::setw(4) << std::min(int(obj.y + obj.height), outputImg.rows)
+                 << slog::endl;
+         }
+-        outputTransform.scaleRect(obj);
++        //outputTransform.scaleRect(obj);
++
++        if (i < OUTPUT_SIZE && isValidLabel(obj.labelID)) {
++                //bboxes[i*BBOX_INFO] = obj.confidence;
++                bboxes[i*BBOX_INFO] = obj.labelID;
++                bboxes[i*BBOX_INFO+1] = std::max(int(obj.x), 0);
++                bboxes[i*BBOX_INFO+2] = std::max(int(obj.y), 0);
++                bboxes[i*BBOX_INFO+3] = std::min(int(obj.x + obj.width), outputImg.cols);
++                bboxes[i*BBOX_INFO+4] = std::min(int(obj.y + obj.height), outputImg.rows);
++                i++;
++        }
++        //std::cout << "output : " << bboxes[i*4] << " : " << bboxes[i*4+1] << " : " << bboxes[i*4+2] << " : " << bboxes[i*4+3] << std::endl;
++
+         std::ostringstream conf;
+         conf << ":" << std::fixed << std::setprecision(1) << obj.confidence * 100 << '%';
+         auto color = palette[obj.labelID];
+@@ -264,10 +310,11 @@ cv::Mat renderDetectionData(DetectionResult& result, const ColorPalette& palette
+             cv::Point2f(obj.x, obj.y - 5), cv::FONT_HERSHEY_COMPLEX_SMALL, 1, color);
+         cv::rectangle(outputImg, obj, color, 2);
+     }
++    *valid_num = i;
+ 
+     try {
+         for (auto& lmark : result.asRef<RetinaFaceDetectionResult>().landmarks) {
+-            outputTransform.scaleCoord(lmark);
++            //outputTransform.scaleCoord(lmark);
+             cv::circle(outputImg, lmark, 2, cv::Scalar(0, 255, 255), -1);
+         }
+     }
+@@ -276,9 +323,26 @@ cv::Mat renderDetectionData(DetectionResult& result, const ColorPalette& palette
+     return outputImg;
+ }
+ 
++bool CreateFIFO(std::string fileName)
++{
++  if (access(fileName.c_str(), F_OK) == -1) {
++    int ret = mkfifo(fileName.c_str(), O_CREAT | 0666);
++    if (-1 == ret) {
++      printf("make fifo error \n");
++      return false;
++    }
++  }
++  return true;
++}
+ 
+ int main(int argc, char *argv[]) {
+     try {
++        cpu_set_t  mask;
++        CPU_ZERO(&mask);
++
++        CPU_SET(0, &mask);
++        CPU_SET(4, &mask);
++        sched_setaffinity(0, sizeof(mask), &mask);
+         PerformanceMetrics metrics;
+ 
+         slog::info << "InferenceEngine: " << printable(*InferenceEngine::GetInferenceEngineVersion()) << slog::endl;
+@@ -365,9 +429,37 @@ int main(int argc, char *argv[]) {
+         OutputTransform outputTransform = OutputTransform();
+         size_t found = FLAGS_output_resolution.find("x");
+ 
++        auto t1 = std::chrono::high_resolution_clock::now();
++        auto t2 = std::chrono::high_resolution_clock::now();
++        auto t3 = std::chrono::high_resolution_clock::now();
++        uint32_t file_num = FLAGS_num;
++        std::cout << "to create yolo file fifo ......waiting" << std::endl;
++        CreateFIFO(_FILE_PATH);
++        CreateFIFO(_OBJECT_DATA);
++        
++        std::cout << "to open yolo file fifo ......waiting" << std::endl;
++        int fd_file = open(_FILE_PATH, O_RDONLY);
++        int fd_data = open(_OBJECT_DATA, O_WRONLY);
++        printf("open yolo fifo: fd_file %d, fd_data %d \n", fd_file, fd_data);
++        
++        char img_id[INPUT_SIZE] = {0};
++        int ret;
++        unsigned int bboxes[BBOX_INFO * OUTPUT_SIZE] = {0};
++        float zero_box[BBOX_INFO] = {0.0};
++        int valid_num = 0;
++
+         while (keepRunning) {
++            img_id[INPUT_SIZE] = {0};
++            ret = read(fd_file, img_id, INPUT_SIZE);
++            if (ret <= 0) {
++                std::cout << "yolo: fail to read from main thread!" << std::endl;
++                return -1;
++            }
++            //std::cout << "\nyolo: image id: " << img_id << std::endl;
++
+             if (pipeline.isReadyToProcess()) {
+                 auto startTime = std::chrono::steady_clock::now();
++                t3 = std::chrono::high_resolution_clock::now();
+ 
+                 //--- Capturing frame
+                 curr_frame = cap->read();
+@@ -380,6 +472,7 @@ int main(int argc, char *argv[]) {
+                         break;
+                     }
+                 }
++                t1 = std::chrono::high_resolution_clock::now();
+ 
+                 frameNum = pipeline.submitData(ImageInputData(curr_frame),
+                     std::make_shared<ImageMetaData>(curr_frame, startTime));
+@@ -414,7 +507,27 @@ int main(int argc, char *argv[]) {
+             //    and use your own processing instead of calling renderDetectionData().
+             while (keepRunning && (result = pipeline.getResult())) {
+                 auto renderingStart = std::chrono::steady_clock::now();
+-                cv::Mat outFrame = renderDetectionData(result->asRef<DetectionResult>(), palette, outputTransform);
++                //cv::Mat outFrame = renderDetectionData(result->asRef<DetectionResult>(), palette, outputTransform);
++                //t2 = std::chrono::high_resolution_clock::now();
++                //auto t12 = std::chrono::duration<float, std::milli>(t2 - t1).count();
++                //std::cout << "yolo forward: " << t12 << " ms" << std::endl;
++                //auto t23 = std::chrono::duration<float, std::milli>(t2 - t3).count();
++                //std::cout << "yolo total: " << t23 << " ms\n" << std::endl;
++
++                valid_num = 0;
++                memset(bboxes, 0, sizeof(bboxes));
++                //std::cout << "yolo obj num: " << result->asRef<DetectionResult>().objects.size() << std::endl;
++                cv::Mat outFrame = renderDetectionData(result->asRef<DetectionResult>(), palette,
++                                        outputTransform, bboxes, &valid_num);
++                if (valid_num) {
++                    ret = write(fd_data, bboxes, BBOX_INFO * valid_num * sizeof(unsigned int));
++                    if (ret < 0)
++                        printf("yolo: predict result write fail!\n");
++                } else {
++                    ret = write(fd_data, zero_box, BBOX_INFO * sizeof(unsigned int));
++                    if (ret < 0)
++                        printf("yolo: predict result write fail!\n");
++                }
+ 
+                 //--- Showing results and device information
+                 presenter.drawGraphs(outFrame);
+@@ -426,6 +539,8 @@ int main(int argc, char *argv[]) {
+                     videoWriter.write(outFrame);
+                 }
+                 framesProcessed++;
++                if (framesProcessed >= file_num)
++                    keepRunning = false;
+ 
+                 if (!FLAGS_no_show) {
+                     cv::imshow("Detection Results", outFrame);
+@@ -448,7 +563,20 @@ int main(int argc, char *argv[]) {
+             if (result != nullptr)
+             {
+                 auto renderingStart = std::chrono::steady_clock::now();
+-                cv::Mat outFrame = renderDetectionData(result->asRef<DetectionResult>(), palette, outputTransform);
++                //cv::Mat outFrame = renderDetectionData(result->asRef<DetectionResult>(), palette, outputTransform);
++                valid_num = 0;
++                cv::Mat outFrame = renderDetectionData(result->asRef<DetectionResult>(), palette,
++                                    outputTransform, bboxes, &valid_num);
++                if (valid_num) {
++                    ret = write(fd_data, bboxes, BBOX_INFO * valid_num * sizeof(unsigned int));
++                    if (ret < 0)
++                        printf("yolo: predict result write fail2!\n");
++                } else {
++                    ret = write(fd_data, zero_box, BBOX_INFO * sizeof(unsigned int));
++                    if (ret < 0)
++                        printf("yolo: predict result write fail2!\n");
++                }
++
+                 //--- Showing results and device information
+                 presenter.drawGraphs(outFrame);
+                 renderMetrics.update(renderingStart);
+@@ -481,7 +609,18 @@ int main(int argc, char *argv[]) {
+             renderMetrics.getTotal().latency << " ms" << slog::endl;
+ 
+         slog::info << presenter.reportMeans() << slog::endl;
++
++        int retval;
++        retval = unlink(_FILE_PATH);
++        if(retval == 0){
++            printf("yolo read fifo deleted.\n");
++        }
++        retval = unlink(_OBJECT_DATA);
++        if(retval == 0){
++            printf("yolo write fifo deleted.\n");
++        }
+     }
++
+     catch (const std::exception& error) {
+         slog::err << error.what() << slog::endl;
+         return 1;
+-- 
+2.25.1
+
