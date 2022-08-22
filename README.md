@@ -130,6 +130,8 @@ cp <your_folder>/pointpillars-on-openvino/tbb/0001-cluster-extraction-TBB.patch 
 git am 0001-cluster-extraction-TBB.patch
 ```
 or for pcl-1.12.0
+```
+cd pcl
 git checkout pcl-1.12.0
 cp <your_folder>/pointpillars-on-openvino/0001-pcl-1.12.0.patch ./
 git am 0001-pcl-1.12.0.patch
